@@ -1560,6 +1560,10 @@ function myPlayer() {
   return (state.players || []).find((p) => p.id === state.playerId) || null;
 }
 
+function aliveOthers(playerId) {
+  return (state.players || []).filter((p) => p.alive && p.id !== playerId);
+}
+
 function renderGame() {
   const meta = state.room;
   if (!meta) return el(`<div class="wrap"><p>Carregando...</p></div>`);
