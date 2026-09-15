@@ -87,6 +87,7 @@ async function dbUpsertPlayer(code, player) {
       name: player.name,
       alive: player.alive,
       role: player.role,
+      ready_round: player.readyRound ?? 0,
     },
     { onConflict: "room_code,id" },
   );
@@ -113,9 +114,43 @@ async function dbFetchPlayers(code) {
     name: r.name,
     alive: r.alive,
     role: r.role,
+    readyRound: r.ready_round ?? 0,
     joinedAt: r.joined_at ? new Date(r.joined_at).getTime() : 0,
   }));
 }
+async function dbMarkReady(code, playerId, round) {
+  const { error } = await sb
+    .from("players")
+    .update({ ready_round: round })
+    .eq("room_code", code)
+    .eq("id", playerId);
+  if (error) console.error("dbMarkReady", error);
+  return !error;
+}
+
+async function allPlayersReady(code, round) {
+  const players = await fetchPlayers(code);
+  if (!players?.length) return false;
+  const participants = players.filter((p) => p.alive);
+  return participants.length > 0 && participants.every((p) => Number(p.readyRound || 0) === Number(round));
+}
+
+async function tryAdvanceRoleReveal() {
+  if (!state.room || state.room.phase !== "role_reveal" || state.busy) return;
+  const round = state.room.round;
+  if (!(await allPlayersReady(state.roomCode, round))) return;
+
+  const duration = NIGHT_TRANSITION_SECONDS;
+  const phaseEndsAt = new Date(Date.now() + duration * 1000).toISOString();
+  const { error } = await sb
+    .from("rooms")
+    .update({ phase: "night_transition", phase_ends_at: phaseEndsAt })
+    .eq("code", state.roomCode)
+    .eq("phase", "role_reveal")
+    .eq("round", round);
+  if (error) console.error("tryAdvanceRoleReveal", error);
+}
+
 async function dbSubmitNightAction(code, round, role, playerId, targetId) {
   const { error } = await sb.from("night_actions").upsert(
     {
@@ -277,51 +312,64 @@ async function dbCreateInvestigationGame(code, round, players) {
     return null;
   }
 
-  const newDetectiveClue = shuffle(cluePool)[0];
-
-  const factsByAudience = {
-    cidadao: shuffle((facts || []).filter(f => f.audience === "cidadao" || f.audience === "todos")),
-    anjo: shuffle((facts || []).filter(f => f.audience === "anjo" || f.audience === "todos")),
-    assassino: shuffle((facts || []).filter(f => f.audience === "assassino" || f.audience === "todos")),
-  };
-  if (factsByAudience.cidadao.length < 3 || factsByAudience.anjo.length < 3 || factsByAudience.assassino.length < 3) {
-    console.error("Fatos insuficientes por papel para o cenário", chosen.id);
-    return null;
-  }
-
   const assignments = [];
-  const addFactsForPlayers = (role, list) => {
-    players.filter(p => p.role === role).forEach(player => {
-      const source = shuffle(list.slice());
-      source.slice(0, 3).forEach((f, i) => assignments.push({
-        game_id: game.id,
-        player_id: player.id,
-        role: player.role,
-        item_type: "fact",
-        source_id: f.id,
-        text_snapshot: f.text,
-        is_true: true,
-        sort_order: i + 1,
+
+  // Rodada 1: todos recebem suas informações iniciais.
+  // Rodadas seguintes: somente o Detetive recebe UMA pista nova.
+  if (Number(round) === 1) {
+    const trueClues = cluePool.filter((c) => c.is_true);
+    const falseClues = cluePool.filter((c) => !c.is_true);
+    if (trueClues.length < 1 || falseClues.length < 2) {
+      console.error("O cenário precisa ter pelo menos 1 pista verdadeira e 2 falsas.", chosen.id);
+      await sb.from("game_investigations").delete().eq("id", game.id);
+      return null;
+    }
+
+    const initialClues = [
+      shuffle(trueClues)[0],
+      ...shuffle(falseClues).slice(0, 2),
+    ];
+
+    const factsByAudience = {
+      cidadao: shuffle((facts || []).filter(f => f.audience === "cidadao" || f.audience === "todos")),
+      anjo: shuffle((facts || []).filter(f => f.audience === "anjo" || f.audience === "todos")),
+      assassino: shuffle((facts || []).filter(f => f.audience === "assassino" || f.audience === "todos")),
+    };
+    if (factsByAudience.cidadao.length < 3 || factsByAudience.anjo.length < 3 || factsByAudience.assassino.length < 3) {
+      console.error("Fatos insuficientes por papel para o cenário", chosen.id);
+      await sb.from("game_investigations").delete().eq("id", game.id);
+      return null;
+    }
+
+    const addFactsForPlayers = (role, list) => {
+      players.filter(p => p.role === role).forEach(player => {
+        shuffle(list.slice()).slice(0, 3).forEach((f, i) => assignments.push({
+          game_id: game.id, player_id: player.id, role: player.role, item_type: "fact",
+          source_id: f.id, text_snapshot: f.text, is_true: true, sort_order: i + 1,
+        }));
+      });
+    };
+    addFactsForPlayers("cidadao", factsByAudience.cidadao);
+    addFactsForPlayers("anjo", factsByAudience.anjo);
+    addFactsForPlayers("assassino", factsByAudience.assassino);
+
+    const detective = players.find(p => p.role === "detetive");
+    if (detective) {
+      initialClues.forEach((clue, i) => assignments.push({
+        game_id: game.id, player_id: detective.id, role: detective.role, item_type: "clue",
+        source_id: clue.id, text_snapshot: clue.text, is_true: clue.is_true, sort_order: i + 1,
       }));
-    });
-  };
-
-  addFactsForPlayers("cidadao", factsByAudience.cidadao);
-  addFactsForPlayers("anjo", factsByAudience.anjo);
-  addFactsForPlayers("assassino", factsByAudience.assassino);
-
-  const detective = players.find(p => p.role === "detetive");
-  if (detective) {
-    assignments.push({
-      game_id: game.id,
-      player_id: detective.id,
-      role: detective.role,
-      item_type: "clue",
-      source_id: newDetectiveClue.id,
-      text_snapshot: newDetectiveClue.text,
-      is_true: newDetectiveClue.is_true,
-      sort_order: 1,
-    });
+    }
+  } else {
+    const detective = players.find(p => p.role === "detetive");
+    if (detective) {
+      const newDetectiveClue = shuffle(cluePool)[0];
+      assignments.push({
+        game_id: game.id, player_id: detective.id, role: detective.role, item_type: "clue",
+        source_id: newDetectiveClue.id, text_snapshot: newDetectiveClue.text,
+        is_true: newDetectiveClue.is_true, sort_order: Number(round),
+      });
+    }
   }
 
   const { error: assignmentError } = await sb.from("game_investigation_items").insert(assignments);
@@ -386,13 +434,25 @@ async function dbGetMyInvestigationItems(gameId, playerId) {
     return data || [];
   }
 
-  // Cidadão, Anjo e Assassino continuam recebendo exatamente 3 fatos por rodada.
+  // Cidadão, Anjo e Assassino recebem apenas os 3 fatos da primeira rodada.
+  const { data: games, error: gamesError } = await sb
+    .from("game_investigations")
+    .select("id,round")
+    .eq("room_code", currentGame.room_code)
+    .eq("round", 1)
+    .limit(1);
+  if (gamesError) {
+    console.error("dbGetMyInvestigationItems.initialGame", gamesError);
+    return [];
+  }
+  const initialGameId = games?.[0]?.id;
+  if (!initialGameId) return [];
   const { data, error } = await sb
     .from("game_investigation_items")
     .select("id,item_type,text_snapshot,is_true,sort_order")
-    .eq("game_id", gameId)
+    .eq("game_id", initialGameId)
     .eq("player_id", playerId)
-    .order("item_type")
+    .eq("item_type", "fact")
     .order("sort_order");
   if (error) {
     console.error("dbGetMyInvestigationItems", error);
@@ -785,6 +845,7 @@ async function refreshOnce() {
       name: p.name,
       alive: p.alive,
       role: p.role,
+      readyRound: p.readyRound,
     })),
   });
 
@@ -800,7 +861,6 @@ async function refreshOnce() {
   }
 
   if (
-    meta.phase === "role_reveal" ||
     meta.phase === "night_transition" ||
     meta.phase === "day_reveal" ||
     meta.phase === "day_results" ||
@@ -811,6 +871,8 @@ async function refreshOnce() {
   } else if (meta.phase === "night") {
     await loadNightProgress();
     if (state.isHost) tryAutoResolveNight();
+  } else if (meta.phase === "role_reveal") {
+    await tryAdvanceRoleReveal();
   }
 }
 
@@ -818,7 +880,7 @@ function getPhaseDuration(meta) {
   if (!meta) return 0;
   switch (meta.phase) {
     case "role_reveal":
-      return ROLE_REVEAL_SECONDS;
+      return 0;
     case "night_transition":
       return NIGHT_TRANSITION_SECONDS;
     case "day_reveal":
@@ -879,9 +941,7 @@ function startPhaseTimer(meta) {
 
     state.phaseTimerHandle = null;
 
-    if (current.phase === "role_reveal") {
-      await dbAdvancePhase(state.roomCode, "role_reveal", "night_transition");
-    } else if (current.phase === "night_transition") {
+    if (current.phase === "night_transition") {
       await dbAdvancePhase(state.roomCode, "night_transition", "night");
     } else if (current.phase === "day_reveal") {
       await dbAdvancePhase(state.roomCode, "day_reveal", "day_discussion");
@@ -1073,6 +1133,7 @@ async function hostStartGame() {
         ...p,
         role: pool[idx],
         alive: true,
+        readyRound: 0,
       }),
     ),
   );
@@ -1087,9 +1148,7 @@ async function hostStartGame() {
   meta.status = "active";
   meta.phase = "role_reveal";
   meta.round = (meta.round || 0) + 1;
-  meta.phaseEndsAt = new Date(
-    Date.now() + ROLE_REVEAL_SECONDS * 1000,
-  ).toISOString();
+  meta.phaseEndsAt = null;
   meta.lastDeathName = null;
   meta.lastEliminatedName = null;
   meta.winner = null;
@@ -1101,6 +1160,7 @@ async function hostStartGame() {
     ...p,
     role: pool[idx],
     alive: true,
+    readyRound: 0,
   }));
   const investigationGame = await dbCreateInvestigationGame(
     state.roomCode,
@@ -1355,9 +1415,6 @@ async function advanceToNextNight() {
   if (!meta || meta.phase !== "day_results") return;
 
   const nextRound = (meta.round || 0) + 1;
-  const phaseEndsAt = new Date(
-    Date.now() + NIGHT_TRANSITION_SECONDS * 1000,
-  ).toISOString();
   const nextLog = Array.isArray(meta.log) ? meta.log.slice() : [];
   const line = `A cidade se prepara para a rodada ${nextRound}.`;
   if (!nextLog.includes(line)) nextLog.push(line);
@@ -1366,8 +1423,8 @@ async function advanceToNextNight() {
     .from("rooms")
     .update({
       round: nextRound,
-      phase: "night_transition",
-      phase_ends_at: phaseEndsAt,
+      phase: "role_reveal",
+      phase_ends_at: null,
       log: nextLog,
     })
     .eq("code", state.roomCode)
@@ -1904,7 +1961,7 @@ function renderGame() {
 
   // As duas fases cinematográficas ocupam a tela inteira.
   // Assim a revelação e a chegada da noite não ficam presas dentro do layout normal.
-  if (meta.phase === "role_reveal") return renderRoleReveal(meta, me);
+  if (meta.phase === "role_reveal") return me.alive ? renderRoleReveal(meta, me) : renderSpectator(meta, me);
   if (meta.phase === "night_transition") return renderNightTransition(meta);
 
   const wrap = el(`<div class="wrap"></div>`);
@@ -2078,21 +2135,41 @@ function renderRoleReveal(meta, me) {
       <h1 class="role-name role-${esc(me.role)}">${esc(info.name)}</h1>
       <p class="tagline role-description">${esc(info.desc)}</p>
       ${renderInvestigationItemsHtml(me)}
-      <div class="role-countdown" id="role-countdown">5</div>
-      <p class="footnote">O jogo começa em instantes.</p>
+      <div class="ready-status" id="ready-status">
+        ${Number(me.readyRound || 0) === Number(meta.round) ? "Você já confirmou que está pronto." : "Leia tudo com atenção antes de confirmar."}
+      </div>
+      <button class="btn btn-primary" id="btn-ready" ${Number(me.readyRound || 0) === Number(meta.round) ? "disabled" : ""}>${Number(me.readyRound || 0) === Number(meta.round) ? "✓ Pronto" : "Li tudo — estou pronto"}</button>
+      <p class="footnote" id="ready-count">Carregando jogadores prontos...</p>
     </div>
   </div>`);
 
-  const countdown = card.querySelector("#role-countdown");
-  const tick = () => {
-    const remain = Math.max(0, Math.ceil(getPhaseRemainingMs(meta) / 1000));
-    countdown.textContent = String(remain);
+  const readyButton = card.querySelector("#btn-ready");
+  const readyCount = card.querySelector("#ready-count");
+
+  const updateReadyCount = async () => {
+    const players = await fetchPlayers(state.roomCode);
+    const participants = (players || []).filter(p => p.alive);
+    const ready = participants.filter(p => Number(p.readyRound || 0) === Number(meta.round)).length;
+    const total = participants.length;
+    readyCount.textContent = total ? `${ready}/${total} jogadores prontos` : "Aguardando jogadores...";
+    if (readyButton && ready === total && total > 0) await tryAdvanceRoleReveal();
   };
-  tick();
-  const iv = setInterval(() => {
-    tick();
-    if (getPhaseRemainingMs(meta) <= 0) clearInterval(iv);
-  }, 100);
+
+  if (readyButton && Number(me.readyRound || 0) !== Number(meta.round)) {
+    readyButton.onclick = async () => {
+      readyButton.disabled = true;
+      const ok = await dbMarkReady(state.roomCode, me.id, meta.round);
+      if (ok) {
+        readyButton.textContent = "✓ Pronto";
+        card.querySelector("#ready-status").textContent = "Você já confirmou que está pronto.";
+        await updateReadyCount();
+        refresh();
+      } else {
+        readyButton.disabled = false;
+      }
+    };
+  }
+  updateReadyCount();
   return card;
 }
 
@@ -2961,4 +3038,17 @@ document.addEventListener("pointerdown", unlockAudio, { passive: true });
     if (restored) { render(); startPolling(); return; }
   }
   render();
+})();
+
+
+/* ===== Revelação: pronto por jogador ===== */
+(function injectReadyRevealStyles(){
+  const style=document.createElement("style");
+  style.textContent=`
+    .ready-status{margin:16px 0 10px;padding:12px 14px;border:1px solid var(--ui-line);border-radius:12px;background:rgba(255,255,255,.025);color:var(--ui-muted);text-align:center;}
+    #btn-ready{width:min(100%,420px);margin:8px auto 0;display:block;}
+    #btn-ready:disabled{opacity:.75;cursor:default;}
+    #ready-count{margin-top:10px;text-align:center;}
+  `;
+  document.head.appendChild(style);
 })();
