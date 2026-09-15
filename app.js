@@ -176,22 +176,18 @@ function computeRoleCounts(n) {
 }
 const ROLE_INFO = {
   assassino: {
-    glyph: "🔪",
     name: "Assassino",
-    desc: "Toda noite, você e os outros assassinos escolhem uma vítima para eliminar. De dia, finja ser inocente.",
+    desc: "Toda noite, escolha uma vítima para eliminar. De dia, finja ser inocente.",
   },
   detetive: {
-    glyph: "🔎",
     name: "Detetive",
-    desc: "Toda noite, você investiga uma pessoa. O resultado indica apenas se ela tem uma função especial ou se é um cidadão comum.",
+    desc: "Toda noite, investigue uma pessoa. O resultado indica apenas se ela tem um papel especial ou se é cidadã.",
   },
   anjo: {
-    glyph: "🕊️",
     name: "Anjo",
-    desc: "Toda noite, você escolhe alguém para proteger. Se essa pessoa for atacada, ela sobrevive.",
+    desc: "Toda noite, escolha alguém para proteger. Se essa pessoa for atacada, ela sobrevive.",
   },
   cidadao: {
-    glyph: "🌾",
     name: "Cidadão",
     desc: "Você não tem poderes especiais. Use a conversa e o voto para descobrir quem são os assassinos.",
   },
@@ -204,6 +200,8 @@ const ROLE_IMAGES = {
 };
 
 const ROLE_REVEAL_SECONDS = 5;
+const DAY_REVEAL_SECONDS = 7;
+const DAY_RESULTS_SECONDS = 7;
 const NIGHT_TRANSITION_SECONDS = 11;
 const AUDIO_ASSETS = {
   bell: "assets/audio/church-bell.mp3",
@@ -233,6 +231,9 @@ const state = {
   audioContext: null,
   audioUnlocked: false,
   nightEnteredAt: null,
+  phaseClientDeadline: null,
+  lastDataSignature: null,
+  lastRenderedPhase: null,
 };
 
 /* ============ room meta shape ============
@@ -331,6 +332,7 @@ async function refresh() {
   if (!meta) return;
 
   const players = await fetchPlayers(state.roomCode);
+  const previousPhase = state.lastPhaseSeen;
 
   state.room = meta;
   state.players = players;
@@ -340,25 +342,31 @@ async function refresh() {
     state.selectedTarget = null;
     state.nightActionConfirmed = false;
     state.lastPhaseSeen = null;
+    state.phaseClientDeadline = null;
+    state.lastDataSignature = null;
   } else if (meta.status === "active" && state.screen !== "game") {
     state.screen = "game";
     state.selectedTarget = null;
     state.nightActionConfirmed = false;
   }
 
-  const phaseChanged = meta.phase !== state.lastPhaseSeen;
+  const phaseChanged = meta.phase !== previousPhase;
 
   if (phaseChanged) {
     state.selectedTarget = null;
     state.nightActionConfirmed = false;
-    if (meta.phase === "night") state.nightEnteredAt = Date.now();
     state.lastPhaseSeen = meta.phase;
+
+    if (meta.phase === "night") state.nightEnteredAt = Date.now();
+
+    // Cada navegador inicia o relógio visual no momento em que recebe a fase.
+    // Isso evita diferenças causadas pelo relógio local dos aparelhos.
+    const duration = getPhaseDuration(meta);
+    state.phaseClientDeadline = duration ? Date.now() + duration * 1000 : null;
   }
 
   const me = (state.players || []).find((p) => p.id === state.playerId);
 
-  // Recupera do banco a ação já confirmada pelo próprio jogador.
-  // Isso impede que um refresh permita escolher outra pessoa.
   if (
     meta.phase === "night" &&
     me &&
@@ -367,30 +375,79 @@ async function refresh() {
   ) {
     const rows = await dbGetNightActions(state.roomCode, meta.round, me.role);
     const ownAction = rows.find((row) => row.playerId === state.playerId);
-
     if (ownAction) {
       state.selectedTarget = ownAction.targetId;
       state.nightActionConfirmed = true;
     }
   }
 
-  // Durante a revelação e a transição, não recrie o DOM a cada polling/realtime.
-  // Isso evita reiniciar as animações e, principalmente, a transição das nuvens.
-  const cinematicPhase =
-    meta.phase === "role_reveal" || meta.phase === "night_transition";
-  if (phaseChanged || !cinematicPhase) {
+  const signature = JSON.stringify({
+    status: meta.status,
+    phase: meta.phase,
+    round: meta.round,
+    lastDeathName: meta.lastDeathName,
+    lastEliminatedName: meta.lastEliminatedName,
+    winner: meta.winner,
+    discussionSeconds: meta.discussionSeconds,
+    votingSeconds: meta.votingSeconds,
+    players: players.map((p) => ({
+      id: p.id,
+      name: p.name,
+      alive: p.alive,
+      role: p.role,
+    })),
+  });
+
+  // No lobby, não recriamos o DOM a cada polling. Isso evita que o <select>
+  // seja destruído enquanto o usuário está abrindo/escolhendo uma opção.
+  const shouldRender =
+    phaseChanged ||
+    state.lastDataSignature === null ||
+    signature !== state.lastDataSignature;
+  if (shouldRender) {
     render();
+    state.lastDataSignature = signature;
   }
 
-  if (meta.phase === "role_reveal" || meta.phase === "night_transition") {
-    // O timer cinematográfico deve nascer uma única vez por fase.
-    // Reiniciá-lo a cada polling/realtime podia prolongar/repetir a transição.
+  if (
+    meta.phase === "role_reveal" ||
+    meta.phase === "night_transition" ||
+    meta.phase === "day_reveal" ||
+    meta.phase === "day_results" ||
+    meta.phase === "day_discussion" ||
+    meta.phase === "day_voting"
+  ) {
     if (phaseChanged || !state.phaseTimerHandle) startPhaseTimer(meta);
   } else if (meta.phase === "night") {
     tryAutoResolveNight();
-  } else if (meta.phase === "day_discussion" || meta.phase === "day_voting") {
-    if (phaseChanged || !state.phaseTimerHandle) startPhaseTimer(meta);
   }
+}
+
+function getPhaseDuration(meta) {
+  if (!meta) return 0;
+  switch (meta.phase) {
+    case "role_reveal":
+      return ROLE_REVEAL_SECONDS;
+    case "night_transition":
+      return NIGHT_TRANSITION_SECONDS;
+    case "day_reveal":
+      return DAY_REVEAL_SECONDS;
+    case "day_discussion":
+      return Number(meta.discussionSeconds) || 90;
+    case "day_voting":
+      return Number(meta.votingSeconds) || 30;
+    case "day_results":
+      return DAY_RESULTS_SECONDS;
+    default:
+      return 0;
+  }
+}
+
+function getPhaseRemainingMs(meta) {
+  if (state.phaseClientDeadline)
+    return Math.max(0, state.phaseClientDeadline - Date.now());
+  if (meta?.phaseEndsAt) return Math.max(0, meta.phaseEndsAt - Date.now());
+  return 0;
 }
 
 function formatSeconds(total) {
@@ -410,17 +467,22 @@ function formatTimer(ms) {
 
 function startPhaseTimer(meta) {
   clearTimeout(state.phaseTimerHandle);
+  state.phaseTimerHandle = null;
 
-  if (!meta.phaseEndsAt) return;
+  const duration = getPhaseDuration(meta);
+  if (!duration && !meta.phaseEndsAt) return;
+
+  if (!state.phaseClientDeadline) {
+    state.phaseClientDeadline = Date.now() + duration * 1000;
+  }
 
   const check = async () => {
     const current = await dbGetRoom(state.roomCode);
     if (!current || current.phase !== meta.phase) return;
 
-    const remain = current.phaseEndsAt - Date.now();
-
+    const remain = getPhaseRemainingMs(current);
     if (remain > 0) {
-      state.phaseTimerHandle = setTimeout(check, Math.min(remain, 500));
+      state.phaseTimerHandle = setTimeout(check, Math.min(remain, 250));
       return;
     }
 
@@ -430,10 +492,14 @@ function startPhaseTimer(meta) {
       await dbAdvancePhase(state.roomCode, "role_reveal", "night_transition");
     } else if (current.phase === "night_transition") {
       await dbAdvancePhase(state.roomCode, "night_transition", "night");
+    } else if (current.phase === "day_reveal") {
+      await dbAdvancePhase(state.roomCode, "day_reveal", "day_discussion");
     } else if (current.phase === "day_discussion") {
       await dbAdvancePhase(state.roomCode, "day_discussion", "day_voting");
     } else if (current.phase === "day_voting") {
       await autoResolveVotes();
+    } else if (current.phase === "day_results") {
+      await advanceToNextNight();
     }
   };
 
@@ -444,13 +510,7 @@ async function dbAdvancePhase(code, fromPhase, toPhase) {
   const meta = await dbGetRoom(code);
   if (!meta || meta.phase !== fromPhase) return;
 
-  const duration =
-    toPhase === "day_voting"
-      ? meta.votingSeconds || 30
-      : toPhase === "night_transition"
-        ? NIGHT_TRANSITION_SECONDS
-        : 0;
-
+  const duration = getNextPhaseDuration(meta, toPhase);
   const phaseEndsAt = duration
     ? new Date(Date.now() + duration * 1000).toISOString()
     : null;
@@ -465,6 +525,15 @@ async function dbAdvancePhase(code, fromPhase, toPhase) {
     .eq("phase", fromPhase);
 
   if (error) console.error("dbAdvancePhase", error);
+}
+
+function getNextPhaseDuration(meta, phase) {
+  if (phase === "night_transition") return NIGHT_TRANSITION_SECONDS;
+  if (phase === "day_discussion") return Number(meta.discussionSeconds) || 90;
+  if (phase === "day_voting") return Number(meta.votingSeconds) || 30;
+  if (phase === "day_reveal") return DAY_REVEAL_SECONDS;
+  if (phase === "day_results") return DAY_RESULTS_SECONDS;
+  return 0;
 }
 
 async function dbResetPlayersForLobby(code) {
@@ -560,16 +629,22 @@ async function hostStartGame() {
     return;
   }
 
-  const counts = computeRoleCounts(players.length);
-  let pool = [];
-
-  for (let i = 0; i < counts.assassino; i++) pool.push("assassino");
-  for (let i = 0; i < counts.detetive; i++) pool.push("detetive");
-  for (let i = 0; i < counts.anjo; i++) pool.push("anjo");
-  for (let i = 0; i < counts.cidadao; i++) pool.push("cidadao");
-
-  pool = shuffle(pool);
+  // Com 4 jogadores, os 4 papéis existem obrigatoriamente.
+  // Acima de 4, os jogadores extras são cidadãos.
+  const pool = shuffle([
+    "assassino",
+    "detetive",
+    "anjo",
+    ...Array(Math.max(0, players.length - 4)).fill("cidadao"),
+  ]);
   const shuffledPlayers = shuffle(players);
+
+  if (pool.length !== shuffledPlayers.length) {
+    state.busy = false;
+    state.error = "Não foi possível distribuir os papéis corretamente.";
+    render();
+    return;
+  }
 
   await Promise.all(
     shuffledPlayers.map((p, idx) =>
@@ -598,7 +673,7 @@ async function hostStartGame() {
   meta.lastEliminatedName = null;
   meta.winner = null;
   meta.log = [
-    `Os papéis foram distribuídos. A cidade se prepara para a primeira noite...`,
+    "Os papéis foram distribuídos. A cidade se prepara para a primeira noite.",
   ];
 
   await dbUpdateRoom(state.roomCode, meta);
@@ -702,65 +777,102 @@ async function tryAutoResolveNight() {
 async function hostResolveNight() {
   if (state.busy) return;
   state.busy = true;
-  render();
-  const round = state.room.round;
-  const players = await fetchPlayers(state.roomCode);
-  const aliveAssassinos = players.filter(
-    (p) => p.alive && p.role === "assassino",
-  );
-  const assassinoVotes = await dbGetNightActions(
-    state.roomCode,
-    round,
-    "assassino",
-  );
-  const counts = {};
-  assassinoVotes.forEach((a) => {
-    if (a.targetId) counts[a.targetId] = (counts[a.targetId] || 0) + 1;
-  });
-  let victimId = null;
-  if (Object.keys(counts).length) {
-    const t = tally(counts);
-    const candidates = t.winner ? [t.winner] : Object.keys(counts);
-    victimId = candidates[Math.floor(Math.random() * candidates.length)];
-  } else if (aliveAssassinos.length) {
-    const targets = players.filter((p) => p.alive && p.role !== "assassino");
-    if (targets.length)
-      victimId = targets[Math.floor(Math.random() * targets.length)].id;
-  }
-  const anjoPicks = await dbGetNightActions(state.roomCode, round, "anjo");
-  const anjoPick = anjoPicks[0]?.targetId || null;
-  let deathName = null;
-  if (victimId && victimId !== anjoPick) {
-    const victim = players.find((p) => p.id === victimId);
-    if (victim) {
-      await dbUpsertPlayer(state.roomCode, { ...victim, alive: false });
-      deathName = victim.name;
-    }
-  }
-  const updatedPlayers = await fetchPlayers(state.roomCode);
-  const meta = await dbGetRoom(state.roomCode);
-  meta.lastDeathName = deathName;
-  meta.phaseEndsAt = null;
-  meta.log.push(
-    deathName
-      ? `🌅 Ao amanhecer, ${deathName} foi encontrado(a) sem vida.`
-      : `🌅 A cidade acorda e, surpreendentemente, ninguém morreu esta noite.`,
-  );
-  const win = checkWinner(updatedPlayers);
-  if (win) {
-    meta.phase = "gameover";
-    meta.winner = win;
-    meta.log.push(
-      win === "cidade"
-        ? "🌾 Os cidadãos descobriram e eliminaram todos os assassinos!"
-        : "🔪 Os assassinos dominaram a cidade!",
+
+  try {
+    const roomBefore = await dbGetRoom(state.roomCode);
+    if (!roomBefore || roomBefore.phase !== "night") return;
+
+    const round = roomBefore.round;
+    const players = await fetchPlayers(state.roomCode);
+    const aliveAssassinos = players.filter(
+      (p) => p.alive && p.role === "assassino",
     );
-  } else {
-    meta.phase = "day_reveal";
+    const assassinoVotes = await dbGetNightActions(
+      state.roomCode,
+      round,
+      "assassino",
+    );
+    const counts = {};
+    assassinoVotes.forEach((a) => {
+      if (a.targetId) counts[a.targetId] = (counts[a.targetId] || 0) + 1;
+    });
+
+    let victimId = null;
+    if (Object.keys(counts).length) {
+      const t = tally(counts);
+      const candidates = t.winner ? [t.winner] : Object.keys(counts);
+      victimId = candidates[Math.floor(Math.random() * candidates.length)];
+    } else if (aliveAssassinos.length) {
+      const targets = players.filter((p) => p.alive && p.role !== "assassino");
+      if (targets.length)
+        victimId = targets[Math.floor(Math.random() * targets.length)].id;
+    }
+
+    const anjoPicks = await dbGetNightActions(state.roomCode, round, "anjo");
+    const anjoPick = anjoPicks[0]?.targetId || null;
+
+    let deathName = null;
+    if (victimId && victimId !== anjoPick) {
+      const victim = players.find((p) => p.id === victimId);
+      if (victim && victim.alive) {
+        const { data: killedRows, error: killError } = await sb
+          .from("players")
+          .update({ alive: false })
+          .eq("room_code", state.roomCode)
+          .eq("id", victimId)
+          .eq("alive", true)
+          .select("id,name")
+          .limit(1);
+
+        if (killError) console.error("hostResolveNight.kill", killError);
+        if (killedRows?.length) deathName = killedRows[0].name;
+      }
+    }
+
+    // Só quem conseguiu alterar o jogador vivo para morto deve concluir a noite.
+    // Se não houve morte, ainda usamos a mudança condicional da fase como trava.
+    const updatedPlayers = await fetchPlayers(state.roomCode);
+    const current = await dbGetRoom(state.roomCode);
+    if (!current || current.phase !== "night") return;
+
+    const win = checkWinner(updatedPlayers);
+    const nextPhase = win ? "gameover" : "day_reveal";
+    const nextWinner = win || null;
+    const nextEndsAt = win
+      ? null
+      : new Date(Date.now() + DAY_REVEAL_SECONDS * 1000).toISOString();
+
+    const logLine = deathName
+      ? `Ao amanhecer, ${deathName} foi encontrado(a) sem vida.`
+      : `A cidade acorda e, surpreendentemente, ninguém morreu esta noite.`;
+
+    const nextLog = Array.isArray(current.log) ? current.log.slice() : [];
+    if (!nextLog.includes(logLine)) nextLog.push(logLine);
+    if (win) {
+      const winnerLine =
+        win === "cidade"
+          ? "Os cidadãos descobriram e eliminaram todos os assassinos!"
+          : "Os assassinos dominaram a cidade!";
+      if (!nextLog.includes(winnerLine)) nextLog.push(winnerLine);
+    }
+
+    const { error: phaseError } = await sb
+      .from("rooms")
+      .update({
+        phase: nextPhase,
+        phase_ends_at: nextEndsAt,
+        last_death_name: deathName,
+        winner: nextWinner,
+        log: nextLog,
+      })
+      .eq("code", state.roomCode)
+      .eq("phase", "night");
+
+    if (phaseError) console.error("hostResolveNight.phase", phaseError);
+  } finally {
+    state.busy = false;
+    refresh();
   }
-  await dbUpdateRoom(state.roomCode, meta);
-  state.busy = false;
-  refresh();
 }
 
 function checkWinner(players) {
@@ -772,13 +884,32 @@ function checkWinner(players) {
   return null;
 }
 
-async function hostGoToDiscussion() {
+async function advanceToNextNight() {
   const meta = await dbGetRoom(state.roomCode);
-  meta.phase = "day_discussion";
-  meta.phaseEndsAt = Date.now() + (meta.discussionSeconds || 90) * 1000;
-  await dbUpdateRoom(state.roomCode, meta);
-  refresh();
+  if (!meta || meta.phase !== "day_results") return;
+
+  const nextRound = (meta.round || 0) + 1;
+  const phaseEndsAt = new Date(
+    Date.now() + NIGHT_TRANSITION_SECONDS * 1000,
+  ).toISOString();
+  const nextLog = Array.isArray(meta.log) ? meta.log.slice() : [];
+  const line = `A cidade se prepara para a rodada ${nextRound}.`;
+  if (!nextLog.includes(line)) nextLog.push(line);
+
+  const { error } = await sb
+    .from("rooms")
+    .update({
+      round: nextRound,
+      phase: "night_transition",
+      phase_ends_at: phaseEndsAt,
+      log: nextLog,
+    })
+    .eq("code", state.roomCode)
+    .eq("phase", "day_results");
+
+  if (error) console.error("advanceToNextNight", error);
 }
+
 async function submitVote(targetId) {
   await dbSubmitVote(
     state.roomCode,
@@ -803,62 +934,83 @@ async function autoResolveVotes() {
 async function hostResolveVotes() {
   if (state.busy && !state.autoResolvingVotes) return;
   state.busy = true;
-  render();
-  const round = state.room.round;
-  const players = await fetchPlayers(state.roomCode);
-  const votes = await dbGetVotes(state.roomCode, round);
-  const counts = {};
-  votes.forEach((v) => {
-    if (v && v !== "abstain") counts[v] = (counts[v] || 0) + 1;
-  });
-  let eliminatedName = null;
-  if (Object.keys(counts).length) {
-    const t = tally(counts);
-    if (t.winner) {
-      const p = players.find((pl) => pl.id === t.winner);
-      if (p) {
-        await dbUpsertPlayer(state.roomCode, { ...p, alive: false });
-        eliminatedName = p.name;
+
+  try {
+    const before = await dbGetRoom(state.roomCode);
+    if (!before || before.phase !== "day_voting") return;
+
+    const round = before.round;
+    const players = await fetchPlayers(state.roomCode);
+    const votes = await dbGetVotes(state.roomCode, round);
+    const counts = {};
+    votes.forEach((v) => {
+      if (v && v !== "abstain") counts[v] = (counts[v] || 0) + 1;
+    });
+
+    let eliminatedName = null;
+    if (Object.keys(counts).length) {
+      const t = tally(counts);
+      if (t.winner) {
+        const p = players.find((pl) => pl.id === t.winner);
+        if (p && p.alive) {
+          const { data: eliminatedRows, error: eliminateError } = await sb
+            .from("players")
+            .update({ alive: false })
+            .eq("room_code", state.roomCode)
+            .eq("id", p.id)
+            .eq("alive", true)
+            .select("id,name")
+            .limit(1);
+          if (eliminateError)
+            console.error("hostResolveVotes.eliminate", eliminateError);
+          if (eliminatedRows?.length) eliminatedName = eliminatedRows[0].name;
+        }
       }
     }
+
+    const updatedPlayers = await fetchPlayers(state.roomCode);
+    const current = await dbGetRoom(state.roomCode);
+    if (!current || current.phase !== "day_voting") return;
+
+    const win = checkWinner(updatedPlayers);
+    const nextPhase = win ? "gameover" : "day_results";
+    const nextEndsAt = win
+      ? null
+      : new Date(Date.now() + DAY_RESULTS_SECONDS * 1000).toISOString();
+    const logLine = eliminatedName
+      ? `A cidade votou e eliminou ${eliminatedName}.`
+      : `Os votos empataram — ninguém foi eliminado.`;
+
+    const nextLog = Array.isArray(current.log) ? current.log.slice() : [];
+    if (!nextLog.includes(logLine)) nextLog.push(logLine);
+    if (win) {
+      const winnerLine =
+        win === "cidade"
+          ? "Os cidadãos descobriram e eliminaram todos os assassinos!"
+          : "Os assassinos dominaram a cidade!";
+      if (!nextLog.includes(winnerLine)) nextLog.push(winnerLine);
+    }
+
+    const { error } = await sb
+      .from("rooms")
+      .update({
+        phase: nextPhase,
+        phase_ends_at: nextEndsAt,
+        last_eliminated_name: eliminatedName,
+        winner: win || null,
+        log: nextLog,
+      })
+      .eq("code", state.roomCode)
+      .eq("phase", "day_voting");
+
+    if (error) console.error("hostResolveVotes.phase", error);
+  } finally {
+    state.busy = false;
+    refresh();
   }
-  const updatedPlayers = await fetchPlayers(state.roomCode);
-  const meta = await dbGetRoom(state.roomCode);
-  meta.lastEliminatedName = eliminatedName;
-  meta.phaseEndsAt = null;
-  meta.log.push(
-    eliminatedName
-      ? `🗳️ A cidade votou e eliminou ${eliminatedName}.`
-      : `🗳️ Os votos empataram — ninguém foi eliminado.`,
-  );
-  const win = checkWinner(updatedPlayers);
-  if (win) {
-    meta.phase = "gameover";
-    meta.winner = win;
-    meta.log.push(
-      win === "cidade"
-        ? "🌾 Os cidadãos descobriram e eliminaram todos os assassinos!"
-        : "🔪 Os assassinos dominaram a cidade!",
-    );
-  } else {
-    meta.phase = "day_results";
-  }
-  await dbUpdateRoom(state.roomCode, meta);
-  state.busy = false;
-  refresh();
 }
 async function hostNextNight() {
-  const meta = await dbGetRoom(state.roomCode);
-  if (!meta || meta.phase !== "day_results") return;
-
-  meta.round += 1;
-  meta.phase = "role_reveal";
-  meta.phaseEndsAt = new Date(
-    Date.now() + ROLE_REVEAL_SECONDS * 1000,
-  ).toISOString();
-  meta.log.push(`🌙 A cidade se prepara para a rodada ${meta.round}...`);
-  await dbUpdateRoom(state.roomCode, meta);
-  refresh();
+  await advanceToNextNight();
 }
 
 async function hostReplayRoom() {
@@ -884,6 +1036,8 @@ async function hostReplayRoom() {
   state.busy = false;
   state.screen = "lobby";
   state.lastPhaseSeen = null;
+  state.phaseClientDeadline = null;
+  state.lastDataSignature = null;
   state.selectedTarget = null;
   state.nightActionConfirmed = false;
   refresh();
@@ -973,7 +1127,7 @@ function renderLanding() {
           <button class="choice" id="btn-create"><span class="glyph">🏮</span><span class="label">Criar sala</span></button>
           <button class="choice" id="btn-join"><span class="glyph">🚪</span><span class="label">Entrar em sala</span></button>
         </div>
-        <p class="footnote" style="margin-top:0;">Jogue com 4 ou mais pessoas.</p>
+        <p class="footnote" style="margin-top:0;">Jogue com 4 ou mais pessoas, cada uma no seu próprio celular.</p>
       </div>
     </div>
     <p class="footnote">Papéis: Assassino 🔪 · Cidadão 🌾 · Detetive 🔎 · Anjo 🕊️</p>
@@ -1000,7 +1154,7 @@ function renderCreate() {
           <label for="in-name">Seu nome</label>
           <input id="in-name" maxlength="18" placeholder="Como quer ser chamado(a)?" autocomplete="off">
         </div>
-
+        <p class="tagline" style="margin:14px 0 0;">Os tempos da partida são definidos depois, no lobby, somente pelo anfitrião.</p>
         <button class="btn btn-primary" id="btn-go">Criar sala</button>
         <p class="error-msg">${esc(state.error)}</p>
       </div>
@@ -1008,7 +1162,6 @@ function renderCreate() {
     </div>
   </div>`);
   const input = wrap.querySelector("#in-name");
-
   wrap.querySelector("#btn-go").onclick = async () => {
     const name = input.value.trim();
     if (!name) {
@@ -1016,20 +1169,16 @@ function renderCreate() {
       render();
       return;
     }
-
     state.error = "";
     await createRoom(name);
   };
-
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") wrap.querySelector("#btn-go").click();
   });
-
   wrap.querySelector("#btn-back").onclick = () => {
     state.screen = "landing";
     render();
   };
-
   return wrap;
 }
 
@@ -1102,49 +1251,47 @@ function renderLobby() {
         : `<p class="tagline">Com ${players.length} jogadores: 1 assassino, 1 detetive, 1 anjo e ${counts.cidadao} cidadão(s).</p>`
     }
 
-    ${
-      state.isHost
-        ? `
-      <div class="card lobby-settings" style="margin-top:18px;">
-        <h3>⚙️ Configurações da sala</h3>
-        <p class="tagline">Defina os tempos da próxima partida. Você pode alterar novamente depois.</p>
+    <div class="card lobby-settings" style="margin-top:18px;">
+      <h3>⚙ Configurações da sala</h3>
+      <p class="tagline">O anfitrião pode alterar os tempos enquanto a sala estiver no lobby.</p>
 
-        <div class="field">
-          <label for="discussion-time">Tempo de discussão</label>
-          <select id="discussion-time">
-            ${[30, 45, 60, 90, 120, 180]
-              .map(
-                (v) =>
-                  `<option value="${v}" ${Number(discussionSeconds) === v ? "selected" : ""}>${formatSeconds(v)}</option>`,
-              )
-              .join("")}
-          </select>
-        </div>
-
-        <div class="field">
-          <label for="voting-time">Tempo de votação</label>
-          <select id="voting-time">
-            ${[15, 30, 45, 60, 90, 120]
-              .map(
-                (v) =>
-                  `<option value="${v}" ${Number(votingSeconds) === v ? "selected" : ""}>${formatSeconds(v)}</option>`,
-              )
-              .join("")}
-          </select>
-        </div>
-
-        <p class="footnote">Somente você, anfitrião, vê e altera essas configurações.</p>
+      <div class="field">
+        <label for="discussion-time">Tempo de discussão</label>
+        <select id="discussion-time" ${state.isHost ? "" : "disabled"}>
+          ${[30, 45, 60, 90, 120, 180]
+            .map(
+              (v) =>
+                `<option value="${v}" ${Number(discussionSeconds) === v ? "selected" : ""}>${formatSeconds(v)}</option>`,
+            )
+            .join("")}
+        </select>
       </div>
 
-      <hr class="divider">
-    `
-        : ""
-    }
+      <div class="field">
+        <label for="voting-time">Tempo de votação</label>
+        <select id="voting-time" ${state.isHost ? "" : "disabled"}>
+          ${[15, 30, 45, 60, 90, 120]
+            .map(
+              (v) =>
+                `<option value="${v}" ${Number(votingSeconds) === v ? "selected" : ""}>${formatSeconds(v)}</option>`,
+            )
+            .join("")}
+        </select>
+      </div>
+
+      ${
+        state.isHost
+          ? `<p class="footnote">Você pode mudar essas opções a qualquer momento antes de iniciar — inclusive depois de uma partida terminar.</p>`
+          : `<p class="footnote">Somente o anfitrião pode alterar os tempos.</p>`
+      }
+    </div>
+
+    <hr class="divider">
 
     ${
       state.isHost
         ? `<button class="btn btn-primary" id="btn-start" ${canStart ? "" : "disabled"}>Iniciar jogo</button>`
-        : `<p class="waiting-block"><span class="glyph">🕯️</span>Aguardando o anfitrião iniciar o jogo...</p>`
+        : `<p class="waiting-block"><span class="status-dot"></span>Aguardando o anfitrião iniciar o jogo...</p>`
     }
   </div>`);
 
@@ -1170,10 +1317,10 @@ function renderLobby() {
   const startBtn = wrap.querySelector("#btn-start");
   if (startBtn) startBtn.onclick = hostStartGame;
 
-  if (state.isHost) {
-    const discussionSelect = wrap.querySelector("#discussion-time");
-    const votingSelect = wrap.querySelector("#voting-time");
+  const discussionSelect = wrap.querySelector("#discussion-time");
+  const votingSelect = wrap.querySelector("#voting-time");
 
+  if (state.isHost) {
     const saveSettings = async () => {
       if (state.busy) return;
       await updateRoomSettings(discussionSelect.value, votingSelect.value);
@@ -1246,9 +1393,9 @@ function phaseTitle(phase) {
       role_reveal: "Revelando seu papel",
       night_transition: "A noite chega...",
       night: "A cidade dorme",
-      day_reveal: "O sol nasce",
+      day_reveal: "O amanhecer",
       day_discussion: "Discussão",
-      day_voting: "Hora de votar",
+      day_voting: "Votação",
       day_results: "Resultado da votação",
     }[phase] || ""
   );
@@ -1329,10 +1476,7 @@ async function playNightSounds() {
 
 function renderNightTransition(meta) {
   const transitionTotalMs = NIGHT_TRANSITION_SECONDS * 1000;
-  const remainingMs = Math.max(
-    0,
-    (meta.phaseEndsAt || Date.now()) - Date.now(),
-  );
+  const remainingMs = getPhaseRemainingMs(meta);
   const elapsedMs = Math.min(
     transitionTotalMs,
     Math.max(0, transitionTotalMs - remainingMs),
@@ -1360,75 +1504,91 @@ function renderNightTransition(meta) {
 function renderRoleReveal(meta, me) {
   const info = ROLE_INFO[me.role] || ROLE_INFO.cidadao;
   const image = ROLE_IMAGES[me.role] || ROLE_IMAGES.cidadao;
-  const remainingMs = Math.max(
-    0,
-    (meta.phaseEndsAt || Date.now()) - Date.now(),
-  );
-  const fadingClass = remainingMs <= 1500 ? " role-reveal-fading" : "";
-
-  const card = el(`<div class="card role-reveal-screen${fadingClass}">
-    <div class="role-reveal-visual">
-      <div class="role-image-frame">
-        <img src="${image}" alt="${esc(info.name)}" class="role-image">
-      </div>
+  const card = el(`<div class="card role-reveal-screen">
+    <div class="role-reveal-visual cinematic-role-card">
+      <p class="eyebrow">CIDADE DORME</p>
+      <h2 class="reveal-heading">Revelando seu papel...</h2>
+      <div class="role-image-frame cinematic-role-image"><img src="${image}" alt="${esc(info.name)}" class="role-image"></div>
       <p class="role-you">Você é</p>
       <h1 class="role-name role-${esc(me.role)}">${esc(info.name)}</h1>
       <p class="tagline role-description">${esc(info.desc)}</p>
       <div class="role-countdown" id="role-countdown">5</div>
-      <p class="footnote">O jogo vai começar...</p>
+      <p class="footnote">O jogo começa em instantes.</p>
     </div>
   </div>`);
 
   const countdown = card.querySelector("#role-countdown");
-
   const tick = () => {
-    const remain = Math.max(
-      0,
-      Math.ceil(((meta.phaseEndsAt || Date.now()) - Date.now()) / 1000),
-    );
+    const remain = Math.max(0, Math.ceil(getPhaseRemainingMs(meta) / 1000));
     countdown.textContent = String(remain);
   };
-
   tick();
-
   const iv = setInterval(() => {
     tick();
-    if (meta.phaseEndsAt && meta.phaseEndsAt <= Date.now()) {
-      clearInterval(iv);
-    }
+    if (getPhaseRemainingMs(meta) <= 0) clearInterval(iv);
   }, 100);
-
   return card;
 }
 
 function renderSpectator(meta, me) {
-  return el(`<div class="card">
-    <div class="waiting-block">
-      <span class="glyph">👻</span>
-      <p>Você morreu e foi eliminado(a) da partida.</p>
-       <p style="margin-top:8px;">Seu papel era <strong style="color:var(--ink)">${ROLE_INFO[me.role]?.name || "não identificado"}</strong>.</p>
-      <p style="margin-top:8px;">Continue acompanhando em silêncio até o fim da partida.</p>
-    </div>
+  return el(`<div class="card death-banner">
+    ${skullSvg(58)}
+    <h2>Você morreu</h2>
+    <p>Você foi eliminado(a) da partida.</p>
+    <p style="margin-top:8px;color:var(--ui-muted);">Seu papel era <strong>${esc(ROLE_INFO[me.role]?.name || "não identificado")}</strong>.</p>
+    <p style="margin-top:8px;color:var(--ui-muted);">Continue na sala e acompanhe o que acontece até o fim.</p>
   </div>`);
 }
 
-function aliveOthers(exceptId) {
-  return (state.players || []).filter((p) => p.alive && p.id !== exceptId);
+function roleAvatar(role, className = "role-avatar") {
+  const src = ROLE_IMAGES[role] || ROLE_IMAGES.cidadao;
+  const alt = ROLE_INFO[role]?.name || "Papel";
+  return `<img src="${src}" alt="${esc(alt)}" class="${className}">`;
+}
+
+function playerAvatar(name, className = "player-avatar") {
+  const initials =
+    String(name || "?")
+      .trim()
+      .split(/\s+/)
+      .slice(0, 2)
+      .map((x) => x[0])
+      .join("")
+      .toUpperCase() || "?";
+  return `<span class="${className}">${esc(initials)}</span>`;
+}
+
+function roleActionIcon(role, size = 46) {
+  const stroke =
+    role === "assassino" ? "#e85b65" : role === "anjo" ? "#f2c078" : "#8ec7ff";
+  const paths = {
+    assassino: `<path d="M11 37 28 20"/><path d="m26 12 10 10"/><path d="M21 27 12 36"/><path d="M31 9c3 0 6 2 8 5"/>`,
+    detetive: `<circle cx="22" cy="22" r="12"/><path d="m31 31 9 9"/>`,
+    anjo: `<path d="M24 38V16"/><path d="M24 16c-7-7-16-4-17 3 0 7 8 10 17 13"/><path d="M24 16c7-7 16-4 17 3 0 7-8 10-17 13"/>`,
+    cidadao: `<circle cx="24" cy="17" r="7"/><path d="M11 40c1-9 7-13 13-13s12 4 13 13"/>`,
+  };
+  return `<svg class="role-action-icon" width="${size}" height="${size}" viewBox="0 0 48 48" fill="none" stroke="${stroke}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[role] || paths.cidadao}</svg>`;
 }
 
 function renderNightPanel(meta, me) {
   const shouldAnimate =
     state.nightEnteredAt && Date.now() - state.nightEnteredAt < 1400;
   const card = el(
-    `<div class="card${shouldAnimate ? " night-action-enter" : ""}"></div>`,
+    `<div class="card night-action-card${shouldAnimate ? " night-action-enter" : ""}"></div>`,
   );
 
   if (me.role === "cidadao") {
     card.appendChild(
-      el(`<div class="waiting-block">
-      <span class="glyph">😴</span>
-      <h3>Você é Cidadão</h3>
-      <p>Você não tem ação noturna. Observe, escute e guarde suas suspeitas para o dia.</p>
+      el(`<div class="night-role-header citizen-header">
+      ${roleAvatar("cidadao")}
+      <div><p class="eyebrow">NOITE — SUA VEZ DE OBSERVAR</p><h2>Você é o Cidadão</h2></div>
+    </div>`),
+    );
+    card.appendChild(
+      el(`<div class="waiting-role-panel">
+      ${roleActionIcon("cidadao", 58)}
+      <h3>A cidade dorme.</h3>
+      <p>Você não tem ação nesta noite. Observe em silêncio e guarde suas suspeitas para o dia.</p>
     </div>`),
     );
     return card;
@@ -1437,18 +1597,18 @@ function renderNightPanel(meta, me) {
   if (!["assassino", "anjo", "detetive"].includes(me.role)) {
     card.appendChild(
       el(
-        `<div class="waiting-block"><span class="glyph">❓</span><p>Seu papel não possui uma ação nesta noite.</p></div>`,
+        `<div class="waiting-role-panel">${roleAvatar("cidadao", "role-avatar role-avatar-large")}<h3>Seu papel não possui ação nesta noite.</h3></div>`,
       ),
     );
     return card;
   }
 
   const headings = {
-    assassino: ["🔪 Escolha uma vítima", "Escolha uma pessoa para eliminar."],
-    anjo: ["🕊️ Escolha quem proteger", "Escolha uma pessoa para proteger."],
+    assassino: ["Escolha uma vítima", "Escolha uma pessoa para eliminar."],
+    anjo: ["Escolha quem proteger", "Escolha uma pessoa para proteger."],
     detetive: [
-      "🔎 Escolha uma pessoa para investigar",
-      "O resultado será apenas 👍 ou 👎.",
+      "Escolha uma pessoa para investigar",
+      "O resultado será apenas um sinal de papel especial ou cidadão.",
     ],
   };
 
@@ -1461,23 +1621,27 @@ function renderNightPanel(meta, me) {
         : (state.players || []).filter((p) => p.alive);
 
   const box = el(`<div>
-    <h3>${title}</h3>
-    <p class="tagline" style="margin:6px 0 14px;">${subtitle}</p>
-    <div class="target-grid" id="night-targets"></div>
-    <p class="footnote" style="margin-top:12px;">Escolha uma pessoa. Depois confirme no botão ✓ ao lado do nome.</p>
+    <div class="night-role-header">
+      ${roleAvatar(me.role)}
+      <div><p class="eyebrow">NOITE — SUA AÇÃO</p><h2>Você é o <strong>${esc(ROLE_INFO[me.role].name)}</strong></h2></div>
+    </div>
+    <div class="action-heading">
+      ${roleActionIcon(me.role, 52)}
+      <div><h3>${title}</h3><p>${subtitle}</p></div>
+    </div>
+    <div class="target-grid visual-target-grid" id="night-targets"></div>
+    <p class="footnote">Selecione uma pessoa. Depois confirme no botão de check.</p>
   </div>`);
 
   const grid = box.querySelector("#night-targets");
-
   targets.forEach((t) => {
-    const row = el(`<div class="action-target-row"></div>`);
+    const row = el(`<div class="action-target-row visual-target-row"></div>`);
     const button = el(
-      `<button class="target-btn action-target-button">${esc(t.name)}${t.id === me.id ? " (você)" : ""}</button>`,
+      `<button class="target-btn action-target-button visual-target-button"></button>`,
     );
-
+    button.innerHTML = `${playerAvatar(t.name)}<span>${esc(t.name)}${t.id === me.id ? " <small>(você)</small>" : ""}</span>`;
     if (state.selectedTarget === t.id) button.classList.add("selected");
     button.disabled = state.nightActionConfirmed;
-
     button.onclick = () => selectNightTarget(t.id);
     row.appendChild(button);
 
@@ -1488,30 +1652,28 @@ function renderNightPanel(meta, me) {
       confirm.onclick = confirmNightAction;
       row.appendChild(confirm);
     }
-
     grid.appendChild(row);
   });
 
   if (state.nightActionConfirmed) {
-    const chosen = targets.find((t) => t.id === state.selectedTarget);
-
-    if (me.role === "detetive" && chosen) {
-      const special = chosen.role === "assassino" || chosen.role === "anjo";
-
-      box.appendChild(
-        el(`<div class="investigation-result ${special ? "positive" : "negative"}">
-        <div class="investigation-symbol">${special ? "👍" : "👎"}</div>
-      </div>`),
-      );
+    if (me.role === "detetive") {
+      const chosen = targets.find((t) => t.id === state.selectedTarget);
+      if (chosen) {
+        const special = chosen.role === "assassino" || chosen.role === "anjo";
+        box.appendChild(
+          el(`<div class="investigation-result ${special ? "positive" : "negative"}">
+          <span class="investigation-symbol">${special ? "✓" : "×"}</span>
+          <div><strong>${special ? "Papel especial" : "Cidadão"}</strong><p>Investigação concluída.</p></div>
+        </div>`),
+        );
+      }
     } else {
       box.appendChild(
-        el(`<div class="action-confirmed">
-        <span class="confirm-check">✓</span>
-        <span>Ação confirmada.</span>
-      </div>`),
+        el(
+          `<div class="action-confirmed"><span class="confirm-check">✓</span><span>Ação confirmada.</span></div>`,
+        ),
       );
     }
-
     box.appendChild(
       el(
         `<p class="footnote">Sua ação já foi registrada e não pode ser alterada nesta noite.</p>`,
@@ -1520,105 +1682,76 @@ function renderNightPanel(meta, me) {
   }
 
   card.appendChild(box);
-  card.appendChild(
-    el(
-      `<p class="footnote">A noite termina automaticamente quando todos os papéis especiais vivos confirmarem sua ação.</p>`,
-    ),
-  );
-
   return card;
 }
 
 function renderDayReveal(meta, me) {
-  const card = el(`<div class="card">
-    <div class="role-reveal">
-      <span class="glyph">${meta.lastDeathName ? "💀" : "🌤️"}</span>
-      <p style="font-size:1.1rem;">${meta.lastDeathName ? `<strong>${esc(meta.lastDeathName)}</strong> não sobreviveu à noite.` : "Ninguém morreu esta noite."}</p>
-    </div>
-    ${state.isHost ? `<button class="btn btn-primary" id="btn-to-discussion">Ir para a discussão</button>` : `<p class="waiting-block"><span class="glyph">🕯️</span>Aguardando o anfitrião continuar...</p>`}
+  const card = el(`<div class="card day-event-card">
+    <div class="event-icon death-icon">${meta.lastDeathName ? skullSvg(58) : sunriseSvg(58)}</div>
+    <p class="eyebrow">AO AMANHECER</p>
+    <h2>${meta.lastDeathName ? `${esc(meta.lastDeathName)} não sobreviveu à noite.` : "Ninguém morreu esta noite."}</h2>
+    <p class="tagline">A cidade terá alguns segundos para absorver o que aconteceu.</p>
+    <div class="phase-mini-timer" id="day-reveal-timer">00:07</div>
   </div>`);
-  const btn = card.querySelector("#btn-to-discussion");
-  if (btn) btn.onclick = hostGoToDiscussion;
+  attachCountdown(card.querySelector("#day-reveal-timer"), meta);
   return card;
 }
 
 function renderDiscussion(meta, me) {
-  const card = el(`<div class="card">
-    <div style="text-align:center; padding:10px 0 4px;">
-      <p class="tagline">Conversem em voz alta sobre quem parece suspeito.</p>
-      <h2 id="timer-display" style="margin-top:14px; color:var(--lantern-soft);">--:--</h2>
+  const card = el(`<div class="card discussion-card">
+    <div class="discussion-head">
+      ${sunSvg(42)}
+      <div><p class="eyebrow">FASE DE DISCUSSÃO</p><h2>Conversem e descubram os assassinos.</h2></div>
     </div>
+    <div class="timer-panel"><span>Tempo restante</span><strong id="timer-display">--:--</strong></div>
     <p class="footnote">A discussão termina automaticamente. Depois começa a votação.</p>
   </div>`);
-
-  const disp = card.querySelector("#timer-display");
-  const tick = () => {
-    disp.textContent = formatTimer(
-      (meta.phaseEndsAt || Date.now()) - Date.now(),
-    );
-  };
-
-  const iv = setInterval(() => {
-    tick();
-    if (meta.phaseEndsAt && meta.phaseEndsAt <= Date.now()) clearInterval(iv);
-  }, 250);
-
-  tick();
+  attachCountdown(card.querySelector("#timer-display"), meta);
   return card;
 }
 
 function renderVoting(meta, me) {
   const alivePlayers = (state.players || []).filter((p) => p.alive);
-
-  const box = el(`<div class="card">
-    <h3>🗳️ Em quem você vota?</h3>
-    <h2 id="vote-timer" style="text-align:center; margin:12px 0; color:var(--lantern-soft);">--:--</h2>
-    <div class="target-grid" id="vote-targets" style="margin-top:14px;"></div>
-    <button class="target-btn" id="vote-abstain" style="margin-top:4px;">Pular</button>
+  const box = el(`<div class="card voting-card">
+    <div class="discussion-head">
+      ${ballotSvg(42)}
+      <div><p class="eyebrow">FASE DE VOTAÇÃO</p><h2>Escolha uma pessoa para votar.</h2></div>
+    </div>
+    <div class="timer-panel"><span>Tempo restante</span><strong id="vote-timer">--:--</strong></div>
+    <div class="target-grid visual-target-grid" id="vote-targets"></div>
+    <button class="target-btn skip-button" id="vote-abstain">Pular</button>
     <p class="footnote">A votação termina automaticamente quando o tempo acabar.</p>
   </div>`);
 
   const grid = box.querySelector("#vote-targets");
-
   alivePlayers
     .filter((p) => p.id !== me.id)
     .forEach((t) => {
-      const b = el(`<button class="target-btn">${esc(t.name)}</button>`);
+      const b = el(`<button class="target-btn visual-target-button"></button>`);
+      b.innerHTML = `${playerAvatar(t.name)}<span>${esc(t.name)}</span>`;
       if (state.selectedTarget === t.id) b.classList.add("selected");
       b.onclick = () => submitVote(t.id);
       grid.appendChild(b);
     });
 
   const abstainBtn = box.querySelector("#vote-abstain");
+  abstainBtn.innerHTML = `${playerAvatar("P")}<span>Pular</span>`;
   if (state.selectedTarget === "abstain") abstainBtn.classList.add("selected");
   abstainBtn.onclick = () => submitVote("abstain");
 
-  const timer = box.querySelector("#vote-timer");
-  const tick = () => {
-    timer.textContent = formatTimer(
-      (meta.phaseEndsAt || Date.now()) - Date.now(),
-    );
-  };
-
-  const iv = setInterval(() => {
-    tick();
-    if (meta.phaseEndsAt && meta.phaseEndsAt <= Date.now()) clearInterval(iv);
-  }, 250);
-
-  tick();
+  attachCountdown(box.querySelector("#vote-timer"), meta);
   return box;
 }
 
 function renderDayResults(meta, me) {
-  const card = el(`<div class="card">
-    <div class="role-reveal">
-      <span class="glyph">${meta.lastEliminatedName ? "⚖️" : "🤝"}</span>
-      <p style="font-size:1.1rem;">${meta.lastEliminatedName ? `<strong>${esc(meta.lastEliminatedName)}</strong> foi eliminado(a) pela cidade.` : "A votação empatou — ninguém foi eliminado."}</p>
-    </div>
-    ${state.isHost ? `<button class="btn btn-primary" id="btn-next-night">Próxima noite</button>` : `<p class="waiting-block"><span class="glyph">🕯️</span>Aguardando o anfitrião continuar...</p>`}
+  const card = el(`<div class="card day-event-card">
+    <div class="event-icon">${resultSvg(58)}</div>
+    <p class="eyebrow">RESULTADO DA VOTAÇÃO</p>
+    <h2>${meta.lastEliminatedName ? `${esc(meta.lastEliminatedName)} foi eliminado(a).` : "Ninguém foi eliminado."}</h2>
+    <p class="tagline">O próximo ciclo começa automaticamente.</p>
+    <div class="phase-mini-timer" id="day-result-timer">00:07</div>
   </div>`);
-  const btn = card.querySelector("#btn-next-night");
-  if (btn) btn.onclick = hostNextNight;
+  attachCountdown(card.querySelector("#day-result-timer"), meta);
   return card;
 }
 
@@ -1627,32 +1760,25 @@ function renderGameOver() {
   const cidadeVenceu = meta.winner === "cidade";
   const me = myPlayer();
 
-  const wrap = el(`<div class="wrap">
-    ${
-      me && !me.alive
-        ? `<div class="card death-banner">
-      <span class="glyph">💀</span>
-      <h2>Você morreu</h2>
-      <p>Você foi eliminado(a), mas pode continuar na sala e acompanhar o resultado.</p>
-    </div>`
-        : ""
-    }
+  const wrap = el(`<div class="wrap game-over-wrap">
+    ${me && !me.alive ? `<div class="card death-banner">${skullSvg(54)}<h2>Você morreu</h2><p>Você foi eliminado(a), mas pode continuar na sala e acompanhar o resultado.</p></div>` : ""}
     <div class="center-stage">
       <div class="card winner-banner">
-        <span class="glyph">${cidadeVenceu ? "🌾" : "🔪"}</span>
-        <h1>${cidadeVenceu ? "A cidade venceu!" : "Os assassinos venceram!"}</h1>
+        ${trophySvg(64)}
+        <p class="eyebrow">FIM DA PARTIDA</p>
+        <h1>${cidadeVenceu ? "Os cidadãos venceram!" : "Os assassinos venceram!"}</h1>
         <p class="tagline">${cidadeVenceu ? "Todos os assassinos foram eliminados." : "Os assassinos dominaram a cidade."}</p>
       </div>
 
-      <div class="card">
-        <h3 style="margin-bottom:12px;">Papéis da partida</h3>
+      <div class="card final-roles-card">
+        <h3>Papéis da partida</h3>
         <div class="player-list" id="final-roles"></div>
       </div>
 
       ${
         state.isHost
           ? `<button class="btn btn-primary" id="btn-replay">Jogar novamente nesta sala</button>`
-          : `<p class="waiting-block"><span class="glyph">🕯️</span>Aguardando o anfitrião iniciar uma nova partida nesta sala...</p>`
+          : `<p class="waiting-block">Aguardando a nova partida nesta mesma sala...</p>`
       }
 
       <button class="btn btn-ghost" id="btn-newgame">Sair da sala</button>
@@ -1660,57 +1786,77 @@ function renderGameOver() {
   </div>`);
 
   const list = wrap.querySelector("#final-roles");
-
   (state.players || []).forEach((p) => {
-    const info = ROLE_INFO[p.role] || {
-      glyph: "❓",
-      name: "Papel não atribuído",
-    };
-    const chip = el(`<div class="player-chip ${p.alive ? "" : "dead"}">
-      <span class="dot"></span>
-      <span>${esc(p.name)} — ${info.glyph} ${info.name}</span>
-    </div>`);
+    const info = ROLE_INFO[p.role] || { name: "Papel não atribuído" };
+    const chip = el(
+      `<div class="player-chip final-role-chip ${p.alive ? "" : "dead"}">${roleAvatar(p.role, "final-role-avatar")}<span>${esc(p.name)}</span><strong>${esc(info.name)}</strong></div>`,
+    );
     list.appendChild(chip);
   });
 
   wrap.querySelector("#btn-newgame").onclick = leaveToLanding;
-
   const replayBtn = wrap.querySelector("#btn-replay");
   if (replayBtn) replayBtn.onclick = hostReplayRoom;
-
   return wrap;
 }
 
 function renderRosterCollapsed() {
-  const me = myPlayer();
-  const details = el(`<details class="card" style="margin-top:18px;">
-    <summary style="cursor:pointer; font-family:var(--serif); font-size:1.05rem;">Jogadores (${(state.players || []).length})</summary>
-    <div class="player-list" style="margin-top:14px;" id="roster-list"></div>
-  </details>`);
+  const details = el(
+    `<details class="card roster-card" style="margin-top:18px;"><summary>Jogadores (${(state.players || []).length})</summary><div class="player-list" style="margin-top:14px;" id="roster-list"></div></details>`,
+  );
   const list = details.querySelector("#roster-list");
   (state.players || []).forEach((p) => {
     const chip = el(
-      `<div class="player-chip ${p.alive ? "" : "dead"}"><span class="dot"></span><span>${esc(p.name)}</span></div>`,
+      `<div class="player-chip ${p.alive ? "" : "dead"}">${playerAvatar(p.name)}<span>${esc(p.name)}</span></div>`,
     );
-    if (p.id === state.playerId) {
-      const info = ROLE_INFO[p.role] || null;
-      chip.appendChild(
-        el(
-          `<span class="you-tag">${info ? info.glyph + " " + info.name : "VOCÊ"}</span>`,
-        ),
-      );
-    }
+    if (p.id === state.playerId)
+      chip.appendChild(el(`<span class="you-tag">VOCÊ</span>`));
     list.appendChild(chip);
   });
   return details;
 }
 
 function renderLog(meta) {
-  const box = el(`<div class="log-box"></div>`);
-  (meta.log || []).slice(-8).forEach((line) => {
-    box.appendChild(el(`<p>${esc(line)}</p>`));
+  const box = el(
+    `<div class="log-box narrator-log"><div class="log-title">Narrador</div></div>`,
+  );
+  const lines = [];
+  (meta.log || []).forEach((line) => {
+    const clean = String(line)
+      .replace(/^[^\p{L}\p{N}]+/u, "")
+      .trim();
+    if (!lines.includes(clean)) lines.push(clean);
   });
+  lines.slice(-8).forEach((line) => box.appendChild(el(`<p>${esc(line)}</p>`)));
   return box;
+}
+
+function attachCountdown(element, meta) {
+  if (!element) return;
+  const tick = () => {
+    element.textContent = formatTimer(getPhaseRemainingMs(meta));
+  };
+  tick();
+  const iv = setInterval(() => {
+    tick();
+    if (getPhaseRemainingMs(meta) <= 0) clearInterval(iv);
+  }, 100);
+}
+
+function skullSvg(size = 54) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M32 7c-14 0-24 10-24 24 0 9 5 16 12 20v6h8v-6h8v6h8v-6c7-4 12-11 12-20C56 17 46 7 32 7Z"/><circle cx="23" cy="31" r="5"/><circle cx="41" cy="31" r="5"/><path d="M29 45h6M32 38v7"/></svg>`;
+}
+function sunriseSvg(size = 54) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M10 49h44"/><path d="M18 42a14 14 0 0 1 28 0"/><path d="M32 11v9M16 18l6 6M48 18l-6 6M11 32h9M53 32h-9"/></svg>`;
+}
+function ballotSvg(size = 54) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M16 8h32v48H16z"/><path d="m23 22 5 5 12-13M23 38h18"/></svg>`;
+}
+function resultSvg(size = 54) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M10 18h44M14 18l3 38h30l3-38"/><path d="M24 28v18M32 28v18M40 28v18M22 10h20"/></svg>`;
+}
+function trophySvg(size = 64) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 64 64" fill="none" stroke="#f2c078" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10h24v13c0 9-5 16-12 16S20 32 20 23V10Z"/><path d="M20 16H9c0 11 5 17 13 17M44 16h11c0 11-5 17-13 17M32 39v11M22 54h20"/></svg>`;
 }
 
 /* ============ extra UI styles ============ */
@@ -1842,7 +1988,10 @@ function renderLog(meta) {
         radial-gradient(circle at 50% 12%,rgba(41,67,120,.46),transparent 32%),
         linear-gradient(180deg,#071631 0%,#020816 100%) !important;
     }
-    .role-reveal-visual { width:min(92vw,560px) !important; }
+    .role-reveal-visual { width:min(92vw,620px) !important; }
+    .cinematic-role-card{padding:20px 18px 30px !important;}
+    .reveal-heading{font-family:Georgia,serif;font-weight:500;font-size:clamp(1.35rem,4vw,2rem);margin:0 0 18px;}
+    .cinematic-role-image{width:min(82vw,430px) !important;aspect-ratio:4/5 !important;}
     .role-image-frame {
       width:min(78vw,410px) !important;
       aspect-ratio:4/5 !important;
@@ -1856,7 +2005,7 @@ function renderLog(meta) {
       border:2px solid #f4be4d !important; color:#fff !important;
       box-shadow:0 0 25px rgba(244,190,77,.15) !important;
     }
-    .role-reveal-screen.role-reveal-fading { animation:roleFadeOut 1.5s ease forwards !important; }
+    .role-reveal-screen.role-reveal-fading { animation:roleFadeOut .8s ease forwards !important; }
     @keyframes roleFadeOut { from{opacity:1;transform:scale(1)} to{opacity:0;transform:scale(1.025)} }
     .night-transition-screen {
       background:radial-gradient(circle at 50% 35%,rgba(25,44,81,.35),transparent 35%),linear-gradient(180deg,#020713,#00030a) !important;
@@ -1998,7 +2147,7 @@ function renderLog(meta) {
     .cloud-d { top:68%; width:62vw; animation-delay:.22s; animation-duration:8.7s; }
     .cloud-e { top:84%; width:76vw; animation-delay:.1s; animation-duration:9.1s; }
     .role-reveal-screen.role-reveal-fading .role-reveal-visual {
-      animation:roleRevealFade 1.45s ease-in forwards;
+      animation:roleRevealFade .8s ease-in forwards;
     }
     .role-reveal-screen .role-countdown {
       animation:countdownGlow 1s infinite alternate;
@@ -2047,6 +2196,161 @@ function renderLog(meta) {
       border-color:var(--blood, #e85b65);
     }
     .death-banner h2 { color:var(--blood, #e85b65); margin:6px 0; }
+
+    /* ===== VISUAL SYSTEM — referência cinematográfica ===== */
+    :root{
+      --ui-bg:#020817;
+      --ui-panel:#071832;
+      --ui-panel-2:#041127;
+      --ui-line:rgba(120,154,216,.24);
+      --ui-gold:#f2c078;
+      --ui-text:#edf3ff;
+      --ui-muted:#9eabc1;
+      --ui-red:#e85b65;
+    }
+    body{font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif !important;}
+    .wrap{width:min(94vw,1120px) !important;}
+    .card{border-radius:16px !important;}
+    .eyebrow{margin:0 0 5px;font-size:.68rem;letter-spacing:.2em;text-transform:uppercase;color:var(--ui-gold);font-weight:700;}
+    .night-role-header,.discussion-head{display:flex;align-items:center;gap:14px;margin-bottom:20px;}
+    .night-role-header h2,.discussion-head h2{margin:0;font-family:Georgia,serif;font-weight:500;}
+    .role-avatar{width:58px;height:58px;min-width:58px;border-radius:50%;object-fit:cover;border:2px solid var(--ui-gold);box-shadow:0 0 0 4px rgba(242,192,120,.08),0 10px 30px rgba(0,0,0,.35);}
+    .role-avatar-large{width:90px;height:90px;min-width:90px;}
+    .player-avatar{width:34px;height:34px;min-width:34px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(145deg,#172c51,#0a1731);border:1px solid rgba(137,170,225,.38);color:#e7efff;font-size:.72rem;font-weight:700;letter-spacing:.04em;}
+    .visual-target-grid{display:grid;gap:8px;}
+    .visual-target-row{display:flex;gap:8px;}
+    .visual-target-button{display:flex !important;align-items:center;gap:12px;text-align:left !important;padding:10px 12px !important;min-height:56px;}
+    .visual-target-button span:last-child{flex:1;}
+    .visual-target-button small{color:var(--ui-muted);}
+    .action-confirm-btn{width:54px;min-width:54px;display:grid;place-items:center;}
+    .action-heading{display:flex;align-items:center;gap:12px;margin:8px 0 16px;padding:14px;border:1px solid var(--ui-line);border-radius:14px;background:rgba(255,255,255,.025);}
+    .action-heading h3{margin:0 0 3px;font-family:Georgia,serif;font-size:1.18rem;}
+    .action-heading p{margin:0;color:var(--ui-muted);font-size:.9rem;}
+    .role-action-icon{display:block;flex:none;}
+    .waiting-role-panel{text-align:center;padding:34px 20px;border:1px solid var(--ui-line);border-radius:15px;background:rgba(255,255,255,.018);}
+    .waiting-role-panel .role-action-icon{margin:0 auto 12px;}
+    .waiting-role-panel h3{margin:8px 0;font-family:Georgia,serif;}
+    .waiting-role-panel p{max-width:520px;margin:0 auto;color:var(--ui-muted);}
+    .investigation-result{display:flex !important;align-items:center;justify-content:center;gap:16px;min-height:92px;margin-top:16px;border-radius:14px !important;}
+    .investigation-result.positive{border-color:rgba(92,218,157,.5) !important;}
+    .investigation-result.negative{border-color:rgba(232,91,101,.45) !important;}
+    .investigation-symbol{font-size:3.3rem;line-height:1;font-weight:700;}
+    .investigation-result p{margin:3px 0 0;color:var(--ui-muted);}
+    .timer-panel{display:flex;align-items:center;justify-content:space-between;padding:15px 18px;border:1px solid var(--ui-line);border-radius:13px;background:rgba(2,10,25,.55);margin:14px 0 16px;}
+    .timer-panel span{color:var(--ui-muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.12em;}
+    .timer-panel strong{font-family:Georgia,serif;font-size:2rem;color:var(--ui-gold);font-weight:500;letter-spacing:.05em;}
+    .phase-mini-timer{display:inline-block;margin-top:18px;padding:8px 18px;border:1px solid rgba(242,192,120,.35);border-radius:999px;color:var(--ui-gold);font-family:Georgia,serif;font-size:1.2rem;}
+    .day-event-card{text-align:center;padding:38px 24px !important;}
+    .event-icon{display:grid;place-items:center;width:88px;height:88px;margin:0 auto 16px;border-radius:50%;color:var(--ui-gold);border:1px solid rgba(242,192,120,.35);background:rgba(242,192,120,.05);}
+    .death-icon{color:var(--ui-red);border-color:rgba(232,91,101,.4);}
+    .day-event-card h2{font-family:Georgia,serif;font-weight:500;margin:6px auto;max-width:650px;}
+    .winner-banner{text-align:center;padding:34px 24px !important;}
+    .winner-banner svg{margin:0 auto 10px;display:block;}
+    .winner-banner h1{font-family:Georgia,serif;font-weight:500;color:var(--ui-gold);}
+    .death-banner{text-align:center !important;padding:28px !important;color:var(--ui-red);}
+    .death-banner svg{display:block;margin:0 auto 8px;}
+    .death-banner h2{color:var(--ui-red) !important;font-family:Georgia,serif;}
+    .final-role-chip{display:grid !important;grid-template-columns:42px 1fr auto;align-items:center;gap:10px;}
+    .final-role-avatar{width:42px !important;height:42px !important;min-width:42px !important;border-width:1px !important;}
+    .final-role-chip strong{color:var(--ui-gold);font-family:Georgia,serif;font-weight:500;}
+    .roster-card summary{cursor:pointer;font-family:Georgia,serif;font-size:1.05rem;}
+    .narrator-log{margin-top:18px;}
+    .log-title{font-family:Georgia,serif;color:var(--ui-gold);margin-bottom:8px;}
+    .narrator-log p{margin:6px 0;color:#b6c2d7;}
+    .skip-button{display:flex !important;align-items:center;gap:12px;justify-content:flex-start;margin-top:10px !important;}
+    .status-dot{width:8px;height:8px;border-radius:50%;background:#58d99b;display:inline-block;box-shadow:0 0 10px rgba(88,217,155,.5);}
+    .lobby-settings{position:relative;z-index:2;}
+    .lobby-settings select{appearance:auto !important;-webkit-appearance:auto !important;position:relative;z-index:3;cursor:pointer;}
+    .lobby-settings{overflow:visible !important;}
+    .lobby-settings select{min-height:48px;display:block;}
+    .lobby-settings .field{position:relative;z-index:3;}
+    .center-stage .card{box-shadow:0 20px 70px rgba(0,0,0,.3),inset 0 1px 0 rgba(255,255,255,.035) !important;}
+    @media(max-width:640px){
+      .role-image-frame{width:min(84vw,350px) !important;}
+      .final-role-chip{grid-template-columns:42px 1fr;}
+      .final-role-chip strong{grid-column:2;}
+      .timer-panel strong{font-size:1.7rem;}
+    }
+  `;
+  document.head.appendChild(style);
+})();
+
+/* ============ home original visual ============ */
+(function injectHomeOriginalStyles() {
+  const style = document.createElement("style");
+  style.textContent = `
+    .home-menu-card{
+      width:min(650px, calc(100vw - 32px)) !important;
+      margin:28px auto 0 !important;
+      padding:28px !important;
+      box-sizing:border-box;
+      border-radius:18px !important;
+      background:rgba(6,20,48,.72) !important;
+      border:1px solid rgba(73,105,157,.48) !important;
+      box-shadow:0 18px 55px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.025) !important;
+    }
+
+    .choice-row{
+      display:grid !important;
+      grid-template-columns:repeat(2,minmax(0,1fr)) !important;
+      gap:12px !important;
+    }
+
+    .home-choice{
+      min-height:128px !important;
+      padding:22px 16px !important;
+      border-radius:17px !important;
+      border:1px solid rgba(73,105,157,.58) !important;
+      background:rgba(7,23,54,.62) !important;
+      color:var(--ink,#eef3ff) !important;
+      display:flex !important;
+      flex-direction:column !important;
+      align-items:center !important;
+      justify-content:center !important;
+      gap:10px !important;
+      box-shadow:none !important;
+      transition:transform .18s ease, border-color .18s ease, background .18s ease !important;
+    }
+
+    .home-choice:hover{
+      transform:translateY(-2px);
+      border-color:rgba(242,192,120,.65) !important;
+      background:rgba(12,31,67,.82) !important;
+    }
+
+    .home-choice-icon{
+      display:block !important;
+      font-size:34px !important;
+      line-height:1 !important;
+      height:40px !important;
+      width:48px !important;
+      text-align:center !important;
+      filter:saturate(.92);
+    }
+
+    .home-choice .label{
+      font-family:var(--serif,Georgia,serif) !important;
+      font-size:1.08rem !important;
+      font-weight:700 !important;
+      letter-spacing:.01em;
+    }
+
+    .home-roles{
+      margin-top:214px !important;
+      text-align:center !important;
+      font-size:.82rem !important;
+      letter-spacing:.02em;
+      opacity:.8;
+    }
+
+    @media(max-width:640px){
+      .home-menu-card{
+        width:calc(100vw - 28px) !important;
+        padding:18px !important;
+      }
+      .home-choice{min-height:112px !important;}
+      .home-roles{margin-top:100px !important;}
+    }
   `;
   document.head.appendChild(style);
 })();
