@@ -54,7 +54,7 @@ async function dbSubmitNightAction(code, round, role, playerId, targetId){
   if(error) console.error('dbSubmitNightAction', error);
 }
 async function dbGetNightActions(code, round, role){
-  const { data, error } = await sb.from('night_actions').select('target_id').eq('room_code', code).eq('round', round).eq('role', role);
+  const { data, error } = await sb.from('night_actions').select('player_id,target_id').eq('room_code', code).eq('round', round).eq('role', role);
   if(error){ console.error('dbGetNightActions', error); return []; }
   return data.map(r => ({ playerId:r.player_id, targetId:r.target_id }));
 }
@@ -102,6 +102,12 @@ const ROLE_INFO = {
   anjo:      { glyph:'🕊️', name:'Anjo', desc:'Toda noite, você escolhe alguém para proteger. Se essa pessoa for atacada, ela sobrevive.' },
   cidadao:   { glyph:'🌾', name:'Cidadão', desc:'Você não tem poderes especiais. Use a conversa e o voto para descobrir quem são os assassinos.' }
 };
+const ROLE_IMAGES = {
+  assassino: 'assets/roles/assassino.svg',
+  detetive: 'assets/roles/detetive.png',
+  anjo: 'assets/roles/anjo.png',
+  cidadao: 'assets/roles/cidadao.png'
+};
 
 /* ============ app state ============ */
 const state = {
@@ -115,30 +121,35 @@ const state = {
   error:'',
   busy:false,
   selectedTarget:null,
+  nightActionConfirmed:false,
   pollHandle:null,
   lastPhaseSeen:null,
   discussionEndsAt:null,
   phaseTimerHandle:null,
   nightResolving:false,
-  autoResolvingVotes:false
+  autoResolvingVotes:false,
+  lastNightTransitionRound:null,
+  audioContext:null,
+  audioUnlocked:false,
+  nightEnteredAt:null
 };
 
 /* ============ room meta shape ============
 {
-  hostId, status:'lobby'|'active', phase:'night'|'day_reveal'|'day_discussion'|'day_voting'|'day_results'|'gameover',
+  hostId, status:'lobby'|'active', phase:'role_reveal'|'night_transition'|'night'|'day_reveal'|'day_discussion'|'day_voting'|'day_results'|'gameover',
   round, log:[strings], lastDeathName, lastEliminatedName, winner: 'cidade'|'assassinos'|null,
   discussionSeconds
 }
 */
 
 /* ============ core actions ============ */
-async function createRoom(name, discussionSeconds=90, votingSeconds=30){
+async function createRoom(name){
   let code = genRoomCode();
   const meta = {
     hostId: state.playerId, status:'lobby', phase:null, round:0,
     log:[], lastDeathName:null, lastEliminatedName:null, winner:null,
-    discussionSeconds:Number(discussionSeconds)||90,
-    votingSeconds:Number(votingSeconds)||30,
+    discussionSeconds:90,
+    votingSeconds:30,
     phaseEndsAt:null
   };
   await dbCreateRoom(code, meta);
@@ -147,6 +158,20 @@ async function createRoom(name, discussionSeconds=90, votingSeconds=30){
   state.isHost = true;
   state.playerName = name;
   enterLobby();
+}
+
+async function updateRoomSettings(discussionSeconds, votingSeconds){
+  if(!state.isHost || !state.roomCode || state.room?.status !== 'lobby') return;
+
+  const meta = await dbGetRoom(state.roomCode);
+  if(!meta || meta.status !== 'lobby') return;
+
+  meta.discussionSeconds = Number(discussionSeconds) || 90;
+  meta.votingSeconds = Number(votingSeconds) || 30;
+
+  await dbUpdateRoom(state.roomCode, meta);
+  state.room = meta;
+  render();
 }
 
 async function joinRoom(code, name){
@@ -175,29 +200,56 @@ async function fetchPlayers(code){
 
 async function refresh(){
   if(!state.roomCode) return;
+
   const meta = await dbGetRoom(state.roomCode);
   if(!meta) return;
+
   const players = await fetchPlayers(state.roomCode);
+
   state.room = meta;
   state.players = players;
+
   if(meta.status === 'lobby' && state.screen === 'game'){
     state.screen = 'lobby';
     state.selectedTarget = null;
+    state.nightActionConfirmed = false;
     state.lastPhaseSeen = null;
   } else if(meta.status === 'active' && state.screen !== 'game'){
     state.screen = 'game';
     state.selectedTarget = null;
+    state.nightActionConfirmed = false;
   }
 
   if(meta.phase !== state.lastPhaseSeen){
     state.selectedTarget = null;
+    state.nightActionConfirmed = false;
+    if(meta.phase === 'night') state.nightEnteredAt = Date.now();
     state.lastPhaseSeen = meta.phase;
+  }
+
+  const me = (state.players || []).find(p => p.id === state.playerId);
+
+  // Recupera do banco a ação já confirmada pelo próprio jogador.
+  // Isso impede que um refresh permita escolher outra pessoa.
+  if(meta.phase === 'night' && me && me.alive && ['assassino','anjo','detetive'].includes(me.role)){
+    const rows = await dbGetNightActions(state.roomCode, meta.round, me.role);
+    const ownAction = rows.find(row => row.playerId === state.playerId);
+
+    if(ownAction){
+      state.selectedTarget = ownAction.targetId;
+      state.nightActionConfirmed = true;
+    }
   }
 
   render();
 
-  if(meta.phase === 'night') tryAutoResolveNight();
-  if(meta.phase === 'day_discussion' || meta.phase === 'day_voting') startPhaseTimer(meta);
+  if(meta.phase === 'role_reveal'){
+    startPhaseTimer(meta);
+  } else if(meta.phase === 'night'){
+    tryAutoResolveNight();
+  } else if(meta.phase === 'day_discussion' || meta.phase === 'day_voting'){
+    startPhaseTimer(meta);
+  }
 }
 
 function formatSeconds(total){
@@ -216,19 +268,27 @@ function formatTimer(ms){
 
 function startPhaseTimer(meta){
   clearTimeout(state.phaseTimerHandle);
+
   if(!meta.phaseEndsAt) return;
 
   const check = async ()=>{
-    const remain = meta.phaseEndsAt - Date.now();
+    const current = await dbGetRoom(state.roomCode);
+    if(!current || current.phase !== meta.phase) return;
+
+    const remain = current.phaseEndsAt - Date.now();
 
     if(remain > 0){
       state.phaseTimerHandle = setTimeout(check, Math.min(remain, 500));
       return;
     }
 
-    if(meta.phase === 'day_discussion'){
+    if(current.phase === 'role_reveal'){
+      await dbAdvancePhase(state.roomCode, 'role_reveal', 'night_transition');
+    } else if(current.phase === 'night_transition'){
+      await dbAdvancePhase(state.roomCode, 'night_transition', 'night');
+    } else if(current.phase === 'day_discussion'){
       await dbAdvancePhase(state.roomCode, 'day_discussion', 'day_voting');
-    } else if(meta.phase === 'day_voting'){
+    } else if(current.phase === 'day_voting'){
       await autoResolveVotes();
     }
   };
@@ -237,13 +297,22 @@ function startPhaseTimer(meta){
 }
 
 async function dbAdvancePhase(code, fromPhase, toPhase){
-  const votingSeconds = state.room?.votingSeconds || 30;
+  const meta = await dbGetRoom(code);
+  if(!meta || meta.phase !== fromPhase) return;
+
+  const duration = toPhase === 'day_voting'
+    ? (meta.votingSeconds || 30)
+    : toPhase === 'night_transition'
+      ? 4200
+      : 0;
+
+  const phaseEndsAt = duration
+    ? new Date(Date.now() + duration * 1000).toISOString()
+    : null;
 
   const { error } = await sb.from('rooms').update({
     phase: toPhase,
-    phase_ends_at: toPhase === 'day_voting'
-      ? new Date(Date.now() + votingSeconds*1000).toISOString()
-      : null
+    phase_ends_at: phaseEndsAt
   }).eq('code', code).eq('phase', fromPhase);
 
   if(error) console.error('dbAdvancePhase', error);
@@ -280,48 +349,96 @@ function subscribeRealtime(code){
 
 /* ---- host: start game ---- */
 async function hostStartGame(){
-  if(state.busy) return;
-  state.busy = true; render();
+  if(!state.isHost || state.busy) return;
+
+  state.busy = true;
+  render();
+
   const players = await fetchPlayers(state.roomCode);
+
+  if(players.length < 4){
+    state.busy = false;
+    state.error = 'São necessários pelo menos 4 jogadores para começar.';
+    render();
+    return;
+  }
+
   const counts = computeRoleCounts(players.length);
   let pool = [];
+
   for(let i=0;i<counts.assassino;i++) pool.push('assassino');
   for(let i=0;i<counts.detetive;i++) pool.push('detetive');
   for(let i=0;i<counts.anjo;i++) pool.push('anjo');
   for(let i=0;i<counts.cidadao;i++) pool.push('cidadao');
+
   pool = shuffle(pool);
   const shuffledPlayers = shuffle(players);
+
   await Promise.all(shuffledPlayers.map((p, idx) =>
-    dbUpsertPlayer(state.roomCode, { ...p, role: pool[idx] || 'cidadao', alive:true })
+    dbUpsertPlayer(state.roomCode, {
+      ...p,
+      role: pool[idx],
+      alive:true
+    })
   ));
+
   const meta = await dbGetRoom(state.roomCode);
+
+  if(!meta || meta.status !== 'lobby'){
+    state.busy = false;
+    return;
+  }
+
   meta.status = 'active';
-  meta.phase = 'night';
+  meta.phase = 'role_reveal';
   meta.round = (meta.round || 0) + 1;
-  meta.phaseEndsAt = null;
-  meta.log = [`A cidade adormece pela primeira vez... (Rodada 1)`];
+  meta.phaseEndsAt = new Date(Date.now() + 5000).toISOString();
+  meta.lastDeathName = null;
+  meta.lastEliminatedName = null;
   meta.winner = null;
+  meta.log = [`Os papéis foram distribuídos. A cidade se prepara para a primeira noite...`];
+
   await dbUpdateRoom(state.roomCode, meta);
+
   state.busy = false;
+  state.selectedTarget = null;
+  state.nightActionConfirmed = false;
+  state.lastPhaseSeen = null;
+
   refresh();
 }
 
 /* ---- night actions ---- */
-async function submitWolfVote(targetId){
-  await dbSubmitNightAction(state.roomCode, state.room.round, 'assassino', state.playerId, targetId);
+function selectNightTarget(targetId){
+  if(state.nightActionConfirmed) return;
   state.selectedTarget = targetId;
   render();
 }
-async function submitDoctorPick(targetId){
-  await dbSubmitNightAction(state.roomCode, state.room.round, 'anjo', state.playerId, targetId);
-  state.selectedTarget = targetId;
+
+async function confirmNightAction(){
+  if(state.nightActionConfirmed || !state.selectedTarget) return;
+
+  const me = myPlayer();
+  if(!me || !me.alive) return;
+
+  const validRoles = ['assassino','anjo','detetive'];
+  if(!validRoles.includes(me.role)) return;
+
+  const target = (state.players || []).find(p => p.id === state.selectedTarget);
+  if(!target || !target.alive || target.id === me.id && me.role !== 'anjo') return;
+
+  await dbSubmitNightAction(
+    state.roomCode,
+    state.room.round,
+    me.role,
+    state.playerId,
+    state.selectedTarget
+  );
+
+  state.nightActionConfirmed = true;
   render();
-}
-async function submitSeerPick(targetId){
-  await dbSubmitNightAction(state.roomCode, state.room.round, 'detetive', state.playerId, targetId);
-  state.selectedTarget = targetId;
-  render();
-  tryAutoResolveNight();
+
+  await tryAutoResolveNight();
 }
 
 function tally(counts){
@@ -337,6 +454,7 @@ async function tryAutoResolveNight(){
   if(state.nightResolving || !state.room || state.room.phase !== 'night') return;
 
   const players = await fetchPlayers(state.roomCode);
+
   const required = players.filter(
     p => p.alive && ['assassino','anjo','detetive'].includes(p.role)
   );
@@ -344,6 +462,7 @@ async function tryAutoResolveNight(){
   if(!required.length) return;
 
   const actions = [];
+
   for(const role of ['assassino','anjo','detetive']){
     const rows = await dbGetNightActions(state.roomCode, state.room.round, role);
     actions.push(...rows);
@@ -354,9 +473,10 @@ async function tryAutoResolveNight(){
   if(required.some(p => !acted.has(p.id))) return;
 
   state.nightResolving = true;
-  try {
+
+  try{
     await hostResolveNight();
-  } finally {
+  }finally{
     state.nightResolving = false;
   }
 }
@@ -479,9 +599,12 @@ async function hostResolveVotes(){
 }
 async function hostNextNight(){
   const meta = await dbGetRoom(state.roomCode);
+  if(!meta || meta.phase !== 'day_results') return;
+
   meta.round += 1;
-  meta.phase = 'night';
-  meta.log.push(`🌙 A cidade dorme novamente... (Rodada ${meta.round})`);
+  meta.phase = 'role_reveal';
+  meta.phaseEndsAt = new Date(Date.now() + 5000).toISOString();
+  meta.log.push(`🌙 A cidade se prepara para a rodada ${meta.round}...`);
   await dbUpdateRoom(state.roomCode, meta);
   refresh();
 }
@@ -509,6 +632,8 @@ async function hostReplayRoom(){
   state.busy = false;
   state.screen = 'lobby';
   state.lastPhaseSeen = null;
+  state.selectedTarget = null;
+  state.nightActionConfirmed = false;
   refresh();
 }
 
@@ -516,7 +641,7 @@ function leaveToLanding(){
   stopPolling();
   Object.assign(state, {
     screen:'landing', roomCode:null, isHost:false, room:null, players:[],
-    error:'', busy:false, selectedTarget:null, lastPhaseSeen:null
+    error:'', busy:false, selectedTarget:null, nightActionConfirmed:false, lastPhaseSeen:null
   });
   render();
 }
@@ -673,39 +798,100 @@ function renderJoin(){
 
 function renderLobby(){
   const players = state.players || [];
-  const canStart = players.length>=4 && state.isHost;
+  const canStart = players.length >= 4 && state.isHost;
   const counts = computeRoleCounts(players.length);
+  const discussionSeconds = state.room?.discussionSeconds || 90;
+  const votingSeconds = state.room?.votingSeconds || 30;
+
   const wrap = el(`<div class="wrap">
     <div class="top-bar">
-      <span class="room-pill">Sala ${esc(state.roomCode||'')}</span>
+      <span class="room-pill">Sala ${esc(state.roomCode || '')}</span>
       <button class="link-btn" id="btn-leave">Sair</button>
     </div>
+
     <div class="card" style="text-align:center;">
       <p class="room-code-label">código da sala</p>
-      <div class="room-code">${esc(state.roomCode||'')}</div>
+      <div class="room-code">${esc(state.roomCode || '')}</div>
       <p class="tagline">Compartilhe esse código com os outros jogadores.</p>
     </div>
+
     <h3 style="margin:22px 0 12px;">Jogadores (${players.length})</h3>
     <div class="player-list" id="lobby-players"></div>
-    ${players.length < 4 ? `<p class="status-line"><span class="pulse"></span>São necessários pelo menos 4 jogadores para começar.</p>` : ''}
-    ${players.length>=4 ? `<p class="tagline">Com ${players.length} jogadores: 1 assassino, 1 detetive, 1 anjo e ${counts.cidadao} cidadão(s).</p>` : ''}
-    ${state.room ? `<p class="tagline" style="margin-top:8px;">Discussão: ${formatSeconds(state.room.discussionSeconds)} · Votação: ${formatSeconds(state.room.votingSeconds)}</p>` : ''}
+
+    ${players.length < 4
+      ? `<p class="status-line"><span class="pulse"></span>São necessários pelo menos 4 jogadores para começar.</p>`
+      : `<p class="tagline">Com ${players.length} jogadores: 1 assassino, 1 detetive, 1 anjo e ${counts.cidadao} cidadão(s).</p>`}
+
+    <div class="card lobby-settings" style="margin-top:18px;">
+      <h3>⚙️ Configurações da sala</h3>
+      <p class="tagline">O anfitrião pode alterar os tempos enquanto a sala estiver no lobby.</p>
+
+      <div class="field">
+        <label for="discussion-time">Tempo de discussão</label>
+        <select id="discussion-time" ${state.isHost ? '' : 'disabled'}>
+          ${[30,45,60,90,120,180].map(v =>
+            `<option value="${v}" ${Number(discussionSeconds)===v?'selected':''}>${formatSeconds(v)}</option>`
+          ).join('')}
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="voting-time">Tempo de votação</label>
+        <select id="voting-time" ${state.isHost ? '' : 'disabled'}>
+          ${[15,30,45,60,90,120].map(v =>
+            `<option value="${v}" ${Number(votingSeconds)===v?'selected':''}>${formatSeconds(v)}</option>`
+          ).join('')}
+        </select>
+      </div>
+
+      ${state.isHost
+        ? `<p class="footnote">Você pode mudar essas opções a qualquer momento antes de iniciar — inclusive depois de uma partida terminar.</p>`
+        : `<p class="footnote">Somente o anfitrião pode alterar os tempos.</p>`}
+    </div>
+
     <hr class="divider">
+
     ${state.isHost
-      ? `<button class="btn btn-primary" id="btn-start" ${canStart?'':'disabled'}>Iniciar jogo</button>`
+      ? `<button class="btn btn-primary" id="btn-start" ${canStart ? '' : 'disabled'}>Iniciar jogo</button>`
       : `<p class="waiting-block"><span class="glyph">🕯️</span>Aguardando o anfitrião iniciar o jogo...</p>`
     }
   </div>`);
+
   const list = wrap.querySelector('#lobby-players');
+
   players.forEach(p=>{
-    const chip = el(`<div class="player-chip"><span class="dot"></span><span>${esc(p.name)}</span></div>`);
-    if(p.id === state.playerId) chip.appendChild(el(`<span class="you-tag">VOCÊ</span>`));
-    else if(state.room && p.id === state.room.hostId) chip.appendChild(el(`<span class="host-tag">anfitrião</span>`));
+    const chip = el(`<div class="player-chip">
+      <span class="dot"></span>
+      <span>${esc(p.name)}</span>
+    </div>`);
+
+    if(p.id === state.playerId){
+      chip.appendChild(el(`<span class="you-tag">VOCÊ</span>`));
+    } else if(state.room && p.id === state.room.hostId){
+      chip.appendChild(el(`<span class="host-tag">anfitrião</span>`));
+    }
+
     list.appendChild(chip);
   });
+
   wrap.querySelector('#btn-leave').onclick = leaveToLanding;
+
   const startBtn = wrap.querySelector('#btn-start');
   if(startBtn) startBtn.onclick = hostStartGame;
+
+  const discussionSelect = wrap.querySelector('#discussion-time');
+  const votingSelect = wrap.querySelector('#voting-time');
+
+  if(state.isHost){
+    const saveSettings = async ()=>{
+      if(state.busy) return;
+      await updateRoomSettings(discussionSelect.value, votingSelect.value);
+    };
+
+    discussionSelect.onchange = saveSettings;
+    votingSelect.onchange = saveSettings;
+  }
+
   return wrap;
 }
 
@@ -737,7 +923,13 @@ function renderGame(){
   </div>`);
   wrap.appendChild(banner);
 
-  if(!me.alive){
+  if(meta.phase === 'role_reveal'){
+    wrap.appendChild(renderRoleReveal(meta, me));
+    return wrap;
+  } else if(meta.phase === 'night_transition'){
+    wrap.appendChild(renderNightTransition(meta));
+    return wrap;
+  } else if(!me.alive){
     wrap.appendChild(renderSpectator(meta, me));
   } else if(meta.phase === 'night'){
     wrap.appendChild(renderNightPanel(meta, me));
@@ -758,17 +950,147 @@ function renderGame(){
 
 function phaseTitle(phase){
   return {
-    night:'A cidade dorme', day_reveal:'O sol nasce', day_discussion:'Discussão',
+    role_reveal:'Revelando seu papel', night_transition:'A noite chega...', night:'A cidade dorme', day_reveal:'O sol nasce', day_discussion:'Discussão',
     day_voting:'Hora de votar', day_results:'Resultado da votação'
   }[phase] || '';
 }
 function phaseSubtitle(meta, me){
+  if(meta.phase==='role_reveal') return 'Memorize seu papel. A noite está chegando...';
+  if(meta.phase==='night_transition') return 'A noite chega... cidade dorme.';
   if(meta.phase==='night') return me.alive ? 'Aja em silêncio, se seu papel permitir.' : 'Você está observando desta rodada.';
   if(meta.phase==='day_reveal') return 'Veja o que aconteceu durante a noite.';
   if(meta.phase==='day_discussion') return 'Conversem e tentem descobrir quem são os assassinos.';
   if(meta.phase==='day_voting') return 'Escolha em quem votar para eliminar.';
   if(meta.phase==='day_results') return 'Veja quem a cidade decidiu eliminar.';
   return '';
+}
+
+/* ============ sons e transição da noite ============ */
+function getAudioContext(){
+  if(!state.audioContext){
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if(!AudioCtx) return null;
+    state.audioContext = new AudioCtx();
+  }
+  return state.audioContext;
+}
+
+async function unlockAudio(){
+  const ctx = getAudioContext();
+  if(!ctx) return;
+  try{
+    if(ctx.state === 'suspended') await ctx.resume();
+    state.audioUnlocked = ctx.state === 'running';
+  }catch(error){
+    console.warn('Áudio indisponível:', error);
+  }
+}
+
+function playTone(ctx, frequency, start, duration, type='sine', gainValue=.04){
+  const oscillator = ctx.createOscillator();
+  const gain = ctx.createGain();
+  oscillator.type = type;
+  oscillator.frequency.setValueAtTime(frequency, start);
+  gain.gain.setValueAtTime(0.0001, start);
+  gain.gain.exponentialRampToValueAtTime(gainValue, start + 0.012);
+  gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+  oscillator.connect(gain);
+  gain.connect(ctx.destination);
+  oscillator.start(start);
+  oscillator.stop(start + duration + .03);
+}
+
+async function playMidnightSounds(){
+  if(state.lastNightTransitionRound === state.room?.round) return;
+  state.lastNightTransitionRound = state.room?.round ?? null;
+
+  const ctx = getAudioContext();
+  if(!ctx) return;
+
+  try{
+    await ctx.resume();
+
+    const now = ctx.currentTime + .05;
+
+    // Sino grave de meia-noite, sintetizado com harmônicos para evitar depender de arquivo externo.
+    [196, 392, 588].forEach((freq, index)=>{
+      playTone(ctx, freq, now + index * .08, 2.6, 'sine', index === 0 ? .065 : .028);
+    });
+    [196, 392, 588].forEach((freq, index)=>{
+      playTone(ctx, freq, now + 1.05 + index * .07, 2.45, 'sine', index === 0 ? .06 : .025);
+    });
+
+    // Duas notas curtas descendentes lembrando o chamado de uma coruja.
+    const owlStart = now + 2.35;
+    playTone(ctx, 760, owlStart, .42, 'triangle', .035);
+    playTone(ctx, 540, owlStart + .33, .58, 'triangle', .04);
+    playTone(ctx, 690, owlStart + .88, .38, 'triangle', .03);
+    playTone(ctx, 480, owlStart + 1.18, .62, 'triangle', .035);
+  }catch(error){
+    console.warn('Não foi possível tocar os sons da noite:', error);
+  }
+}
+
+function renderNightTransition(meta){
+  const transitionTotalMs = 4200;
+  const remainingMs = Math.max(0, (meta.phaseEndsAt || Date.now()) - Date.now());
+  const elapsedMs = Math.max(0, transitionTotalMs - remainingMs);
+  const animationOffset = `animation-delay:-${elapsedMs}ms`;
+
+  const wrap = el(`<div class="night-transition-screen" aria-live="polite" style="--transition-elapsed:${elapsedMs}ms;">
+    <div class="night-cloud cloud-a"></div>
+    <div class="night-cloud cloud-b"></div>
+    <div class="night-cloud cloud-c"></div>
+    <div class="night-cloud cloud-d"></div>
+    <div class="night-cloud cloud-e"></div>
+    <div class="night-transition-content">
+      <div class="transition-moon">${moonSvg(72)}</div>
+      <p class="transition-eyebrow">MEIA-NOITE</p>
+      <h1>A noite chega...</h1>
+      <p>cidade dorme</p>
+    </div>
+  </div>`);
+
+  playMidnightSounds();
+  return wrap;
+}
+
+function renderRoleReveal(meta, me){
+  const info = ROLE_INFO[me.role] || ROLE_INFO.cidadao;
+  const image = ROLE_IMAGES[me.role] || ROLE_IMAGES.cidadao;
+  const remainingMs = Math.max(0, (meta.phaseEndsAt || Date.now()) - Date.now());
+  const fadingClass = remainingMs <= 1500 ? ' role-reveal-fading' : '';
+
+  const card = el(`<div class="card role-reveal-screen${fadingClass}">
+    <div class="role-reveal-visual">
+      <div class="role-image-frame">
+        <img src="${image}" alt="${esc(info.name)}" class="role-image">
+      </div>
+      <p class="role-you">Você é</p>
+      <h1 class="role-name role-${esc(me.role)}">${esc(info.name)}</h1>
+      <p class="tagline role-description">${esc(info.desc)}</p>
+      <div class="role-countdown" id="role-countdown">5</div>
+      <p class="footnote">O jogo vai começar...</p>
+    </div>
+  </div>`);
+
+  const countdown = card.querySelector('#role-countdown');
+
+  const tick = ()=>{
+    const remain = Math.max(0, Math.ceil(((meta.phaseEndsAt || Date.now()) - Date.now()) / 1000));
+    countdown.textContent = String(remain);
+  };
+
+  tick();
+
+  const iv = setInterval(()=>{
+    tick();
+    if(meta.phaseEndsAt && meta.phaseEndsAt <= Date.now()){
+      clearInterval(iv);
+    }
+  }, 100);
+
+  return card;
 }
 
 function renderSpectator(meta, me){
@@ -787,74 +1109,86 @@ function aliveOthers(exceptId){
 }
 
 function renderNightPanel(meta, me){
-  const card = el(`<div class="card"></div>`);
-  const round = meta.round;
+  const shouldAnimate = state.nightEnteredAt && Date.now() - state.nightEnteredAt < 1400;
+  const card = el(`<div class="card${shouldAnimate ? ' night-action-enter' : ''}"></div>`);
 
   if(me.role === 'cidadao'){
-    card.appendChild(el(`<div class="waiting-block"><span class="glyph">😴</span><p>Você não tem ação noturna. Durma tranquilo(a)... por enquanto.</p></div>`));
-  }
-  if(me.role === 'assassino'){
-    const colegas = (state.players||[]).filter(p=>p.role==='assassino' && p.id!==me.id && p.alive);
-    const targets = aliveOthers(me.id).filter(p=>p.role!=='assassino');
-    const box = el(`<div>
-      <h3>🐺 Escolha uma vítima</h3>
-      ${colegas.length ? `<p class="tagline" style="margin:6px 0 14px;">Seus companheiros assassinos: ${colegas.map(t=>esc(t.name)).join(', ')}</p>` : `<p class="tagline" style="margin:6px 0 14px;">Você é o único assassino restante.</p>`}
-      <div class="target-grid" id="assassino-targets"></div>
-    </div>`);
-    const grid = box.querySelector('#assassino-targets');
-    targets.forEach(t=>{
-      const b = el(`<button class="target-btn">${esc(t.name)}</button>`);
-      if(state.selectedTarget===t.id) b.classList.add('selected');
-      b.onclick = ()=>submitWolfVote(t.id);
-      grid.appendChild(b);
-    });
-    card.appendChild(box);
-  }
-  if(me.role === 'anjo'){
-    const targets = aliveOthers(null).concat(me.alive? [me]:[]).filter((p,i,arr)=>arr.findIndex(x=>x.id===p.id)===i);
-    const box = el(`<div>
-      <h3>🩹 Escolha quem proteger</h3>
-      <div class="target-grid" id="doc-targets"></div>
-    </div>`);
-    const grid = box.querySelector('#doc-targets');
-    (state.players||[]).filter(p=>p.alive).forEach(t=>{
-      const b = el(`<button class="target-btn">${esc(t.name)}${t.id===me.id?' (você)':''}</button>`);
-      if(state.selectedTarget===t.id) b.classList.add('selected');
-      b.onclick = ()=>submitDoctorPick(t.id);
-      grid.appendChild(b);
-    });
-    card.appendChild(box);
-  }
-  if(me.role === 'detetive'){
-    const targets = aliveOthers(me.id);
-    const box = el(`<div>
-      <h3>🔮 Investigar alguém</h3>
-      <div class="target-grid" id="detetive-targets"></div>
-      <p id="detetive-result" class="status-line" style="margin-top:14px;"></p>
-    </div>`);
-    const grid = box.querySelector('#detetive-targets');
-    targets.forEach(t=>{
-      const b = el(`<button class="target-btn">${esc(t.name)}</button>`);
-      if(state.selectedTarget===t.id) b.classList.add('selected');
-      b.onclick = async ()=>{
-        await submitSeerPick(t.id);
-        const resultEl = box.querySelector('#detetive-result');
-        const isAssassino = t.role === 'assassino';
-        resultEl.innerHTML = `<span style="color:${isAssassino?'var(--blood)':'var(--sage)'}">● </span> ${esc(t.name)} ${isAssassino? 'é um assassino!' : 'não é um assassino.'}`;
-      };
-      grid.appendChild(b);
-    });
-    if(state.selectedTarget){
-      const chosen = targets.find(t=>t.id===state.selectedTarget);
-      if(chosen){
-        const isAssassino = chosen.role==='assassino';
-        box.querySelector('#detetive-result').innerHTML = `<span style="color:${isAssassino?'var(--blood)':'var(--sage)'}">● </span> ${esc(chosen.name)} ${isAssassino? 'é um assassino!' : 'não é um assassino.'}`;
-      }
-    }
-    card.appendChild(box);
+    card.appendChild(el(`<div class="waiting-block">
+      <span class="glyph">😴</span>
+      <h3>Você é Cidadão</h3>
+      <p>Você não tem ação noturna. Observe, escute e guarde suas suspeitas para o dia.</p>
+    </div>`));
+    return card;
   }
 
-  card.appendChild(el(`<p class="footnote">A noite termina automaticamente quando todos os papéis especiais vivos fizerem sua escolha.</p>`));
+  if(!['assassino','anjo','detetive'].includes(me.role)){
+    card.appendChild(el(`<div class="waiting-block"><span class="glyph">❓</span><p>Seu papel não possui uma ação nesta noite.</p></div>`));
+    return card;
+  }
+
+  const headings = {
+    assassino: ['🔪 Escolha uma vítima', 'Escolha uma pessoa para eliminar.'],
+    anjo: ['🕊️ Escolha quem proteger', 'Escolha uma pessoa para proteger.'],
+    detetive: ['🔎 Escolha uma pessoa para investigar', 'O resultado será apenas 👍 ou 👎.']
+  };
+
+  const [title, subtitle] = headings[me.role];
+  const targets = me.role === 'assassino'
+    ? aliveOthers(me.id).filter(p => p.role !== 'assassino')
+    : me.role === 'detetive'
+      ? aliveOthers(me.id)
+      : (state.players || []).filter(p => p.alive);
+
+  const box = el(`<div>
+    <h3>${title}</h3>
+    <p class="tagline" style="margin:6px 0 14px;">${subtitle}</p>
+    <div class="target-grid" id="night-targets"></div>
+    <p class="footnote" style="margin-top:12px;">Escolha uma pessoa. Depois confirme no botão ✓ ao lado do nome.</p>
+  </div>`);
+
+  const grid = box.querySelector('#night-targets');
+
+  targets.forEach(t=>{
+    const row = el(`<div class="action-target-row"></div>`);
+    const button = el(`<button class="target-btn action-target-button">${esc(t.name)}${t.id===me.id?' (você)':''}</button>`);
+
+    if(state.selectedTarget === t.id) button.classList.add('selected');
+    button.disabled = state.nightActionConfirmed;
+
+    button.onclick = ()=>selectNightTarget(t.id);
+    row.appendChild(button);
+
+    if(state.selectedTarget === t.id && !state.nightActionConfirmed){
+      const confirm = el(`<button class="action-confirm-btn" title="Confirmar ação" aria-label="Confirmar ação">✓</button>`);
+      confirm.onclick = confirmNightAction;
+      row.appendChild(confirm);
+    }
+
+    grid.appendChild(row);
+  });
+
+  if(state.nightActionConfirmed){
+    const chosen = targets.find(t => t.id === state.selectedTarget);
+
+    if(me.role === 'detetive' && chosen){
+      const special = chosen.role === 'assassino' || chosen.role === 'anjo';
+
+      box.appendChild(el(`<div class="investigation-result ${special?'positive':'negative'}">
+        <div class="investigation-symbol">${special ? '👍' : '👎'}</div>
+      </div>`));
+    } else {
+      box.appendChild(el(`<div class="action-confirmed">
+        <span class="confirm-check">✓</span>
+        <span>Ação confirmada.</span>
+      </div>`));
+    }
+
+    box.appendChild(el(`<p class="footnote">Sua ação já foi registrada e não pode ser alterada nesta noite.</p>`));
+  }
+
+  card.appendChild(box);
+  card.appendChild(el(`<p class="footnote">A noite termina automaticamente quando todos os papéis especiais vivos confirmarem sua ação.</p>`));
+
   return card;
 }
 
@@ -948,32 +1282,50 @@ function renderDayResults(meta, me){
 function renderGameOver(){
   const meta = state.room;
   const cidadeVenceu = meta.winner === 'cidade';
+  const me = myPlayer();
+
   const wrap = el(`<div class="wrap">
+    ${me && !me.alive ? `<div class="card death-banner">
+      <span class="glyph">💀</span>
+      <h2>Você morreu</h2>
+      <p>Você foi eliminado(a), mas pode continuar na sala e acompanhar o resultado.</p>
+    </div>` : ''}
     <div class="center-stage">
       <div class="card winner-banner">
         <span class="glyph">${cidadeVenceu?'🌾':'🔪'}</span>
         <h1>${cidadeVenceu? 'A cidade venceu!' : 'Os assassinos venceram!'}</h1>
         <p class="tagline">${cidadeVenceu? 'Todos os assassinos foram eliminados.' : 'Os assassinos dominaram a cidade.'}</p>
       </div>
+
       <div class="card">
-        <h3 style="margin-bottom:12px;">Todos os papéis</h3>
+        <h3 style="margin-bottom:12px;">Papéis da partida</h3>
         <div class="player-list" id="final-roles"></div>
       </div>
+
       ${state.isHost
         ? `<button class="btn btn-primary" id="btn-replay">Jogar novamente nesta sala</button>`
         : `<p class="waiting-block"><span class="glyph">🕯️</span>Aguardando o anfitrião iniciar uma nova partida nesta sala...</p>`}
+
       <button class="btn btn-ghost" id="btn-newgame">Sair da sala</button>
     </div>
   </div>`);
+
   const list = wrap.querySelector('#final-roles');
-  (state.players||[]).forEach(p=>{
+
+  (state.players || []).forEach(p=>{
     const info = ROLE_INFO[p.role] || { glyph:'❓', name:'Papel não atribuído' };
-    const chip = el(`<div class="player-chip ${p.alive?'':'dead'}"><span class="dot"></span><span>${esc(p.name)} — ${info.glyph} ${info.name}</span></div>`);
+    const chip = el(`<div class="player-chip ${p.alive?'':'dead'}">
+      <span class="dot"></span>
+      <span>${esc(p.name)} — ${info.glyph} ${info.name}</span>
+    </div>`);
     list.appendChild(chip);
   });
+
   wrap.querySelector('#btn-newgame').onclick = leaveToLanding;
+
   const replayBtn = wrap.querySelector('#btn-replay');
   if(replayBtn) replayBtn.onclick = hostReplayRoom;
+
   return wrap;
 }
 
@@ -1003,5 +1355,259 @@ function renderLog(meta){
   return box;
 }
 
+/* ============ extra UI styles ============ */
+(function injectGameStyles(){
+  const style = document.createElement('style');
+  style.textContent = `
+    .role-reveal-screen { overflow:hidden; }
+    .role-reveal-visual { text-align:center; padding:10px 0 4px; }
+    .role-image-frame {
+      width:min(100%, 340px);
+      aspect-ratio:4/5;
+      margin:0 auto 18px;
+      border-radius:18px;
+      overflow:hidden;
+      border:2px solid var(--lantern, #f2c078);
+      box-shadow:0 12px 40px rgba(0,0,0,.45);
+      background:var(--night-deep, #07152f);
+    }
+    .role-image {
+      width:100%;
+      height:100%;
+      display:block;
+      object-fit:cover;
+    }
+    .role-you { margin:0; font-family:var(--serif, Georgia, serif); font-size:1.05rem; }
+    .role-name {
+      margin:2px 0 8px;
+      font-family:var(--serif, Georgia, serif);
+      font-size:clamp(2rem, 7vw, 3.1rem);
+      letter-spacing:.04em;
+      text-transform:uppercase;
+    }
+    .role-assassino { color:var(--blood, #e85b65); }
+    .role-detetive { color:#b9d7ff; }
+    .role-anjo { color:var(--lantern, #f2c078); }
+    .role-cidadao { color:var(--lantern, #f2c078); }
+    .role-description { max-width:540px; margin:0 auto; }
+    .role-countdown {
+      width:64px;
+      height:64px;
+      display:grid;
+      place-items:center;
+      margin:20px auto 8px;
+      border:2px solid var(--lantern, #f2c078);
+      border-radius:50%;
+      font-size:1.8rem;
+      font-weight:700;
+    }
+    .action-target-row {
+      display:flex;
+      gap:8px;
+      align-items:stretch;
+      margin-bottom:8px;
+    }
+    .action-target-button {
+      flex:1;
+      margin:0;
+      text-align:left;
+    }
+    .action-target-button:disabled {
+      opacity:.85;
+      cursor:default;
+    }
+    .action-confirm-btn {
+      min-width:52px;
+      border:1px solid var(--lantern, #f2c078);
+      border-radius:10px;
+      background:var(--lantern, #f2c078);
+      color:#101522;
+      font-size:1.25rem;
+      font-weight:800;
+      cursor:pointer;
+    }
+    .action-confirm-btn:hover { filter:brightness(1.08); }
+    .action-confirmed {
+      display:flex;
+      align-items:center;
+      gap:9px;
+      margin-top:12px;
+      padding:12px 14px;
+      border:1px solid var(--sage, #63d49a);
+      border-radius:10px;
+      color:var(--sage, #63d49a);
+    }
+    .confirm-check { font-size:1.2rem; font-weight:800; }
+    .investigation-result {
+      display:flex;
+      justify-content:center;
+      align-items:center;
+      min-height:110px;
+      margin-top:18px;
+      border-radius:14px;
+      border:1px solid var(--line, #24375c);
+      background:rgba(255,255,255,.03);
+    }
+    .investigation-symbol {
+      font-size:4.5rem;
+      line-height:1;
+    }
+    .lobby-settings .field { margin-top:14px; }
+    .lobby-settings select {
+      width:100%;
+      box-sizing:border-box;
+      background:var(--night-deep, #07152f);
+      border:1px solid var(--line, #24375c);
+      border-radius:10px;
+      padding:13px 14px;
+      color:var(--ink, #f5f2ea);
+      font-size:1rem;
+      font-family:var(--sans, Arial, sans-serif);
+    }
+    .lobby-settings select:focus {
+      outline:2px solid var(--lantern, #f2c078);
+      outline-offset:1px;
+      border-color:var(--lantern, #f2c078);
+    }
+    .night-transition-screen {
+      position:fixed;
+      inset:0;
+      z-index:9999;
+      overflow:hidden;
+      display:grid;
+      place-items:center;
+      background:
+        radial-gradient(circle at 50% 42%, rgba(45,57,95,.72), transparent 34%),
+        linear-gradient(180deg, #020713 0%, #071329 48%, #020713 100%);
+      color:var(--ink, #f5f2ea);
+      isolation:isolate;
+    }
+    .night-transition-screen::before {
+      content:"";
+      position:absolute;
+      inset:0;
+      background:radial-gradient(circle at 50% 35%, rgba(242,192,120,.12), transparent 18%);
+      animation:nightPulse 4.2s ease-in-out both;
+      animation-delay:calc(-1 * var(--transition-elapsed, 0ms));
+      z-index:1;
+    }
+    .night-transition-content {
+      position:relative;
+      z-index:10;
+      text-align:center;
+      opacity:0;
+      transform:translateY(12px) scale(.98);
+      animation:nightTitleIn 1s .45s ease-out forwards;
+      animation-delay:calc(.45s - var(--transition-elapsed, 0ms));
+      padding:24px;
+      text-shadow:0 5px 30px rgba(0,0,0,.75);
+    }
+    .transition-moon {
+      margin:0 auto 12px;
+      filter:drop-shadow(0 0 24px rgba(242,192,120,.34));
+      animation:moonFloat 4.2s ease-in-out both;
+      animation-delay:calc(-1 * var(--transition-elapsed, 0ms));
+    }
+    .transition-eyebrow {
+      margin:0 0 4px;
+      font-size:.76rem;
+      letter-spacing:.34em;
+      color:var(--lantern-soft, #f6d49e);
+      font-weight:700;
+    }
+    .night-transition-content h1 {
+      margin:0;
+      font-family:var(--serif, Georgia, serif);
+      font-size:clamp(2rem, 8vw, 4.2rem);
+      font-weight:500;
+    }
+    .night-transition-content > p:last-child {
+      margin:2px 0 0;
+      font-family:var(--serif, Georgia, serif);
+      font-size:clamp(1.3rem, 5vw, 2rem);
+      color:var(--lantern, #f2c078);
+      letter-spacing:.14em;
+      text-transform:uppercase;
+    }
+    .night-cloud {
+      position:absolute;
+      z-index:4;
+      width:52vw;
+      height:17vh;
+      min-width:420px;
+      border-radius:999px;
+      background:rgba(1,5,14,.92);
+      filter:blur(18px);
+      box-shadow:
+        0 0 50px rgba(0,0,0,.85),
+        100px 24px 0 20px rgba(1,5,14,.9),
+        -120px 14px 0 28px rgba(1,5,14,.88),
+        210px 42px 0 12px rgba(1,5,14,.82),
+        -220px 36px 0 18px rgba(1,5,14,.85);
+      opacity:.94;
+      transform:translateX(115vw) scale(1.25);
+      animation:cloudSweep 3.75s cubic-bezier(.18,.72,.2,1) forwards;
+      animation-delay:calc(-1 * var(--transition-elapsed, 0ms));
+    }
+    .cloud-a { top:7%; animation-delay:0s; }
+    .cloud-b { top:28%; width:64vw; animation-delay:.16s; animation-duration:3.55s; }
+    .cloud-c { top:49%; width:70vw; animation-delay:.05s; animation-duration:3.85s; }
+    .cloud-d { top:68%; width:62vw; animation-delay:.22s; animation-duration:3.65s; }
+    .cloud-e { top:84%; width:76vw; animation-delay:.1s; animation-duration:3.9s; }
+    .role-reveal-screen.role-reveal-fading .role-reveal-visual {
+      animation:roleRevealFade 1.45s ease-in forwards;
+    }
+    .role-reveal-screen .role-countdown {
+      animation:countdownGlow 1s infinite alternate;
+    }
+    @keyframes roleRevealFade {
+      from { opacity:1; transform:scale(1); }
+      to { opacity:0; transform:scale(.96); }
+    }
+    @keyframes countdownGlow {
+      from { box-shadow:0 0 0 rgba(242,192,120,0); }
+      to { box-shadow:0 0 22px rgba(242,192,120,.25); }
+    }
+    @keyframes cloudSweep {
+      0% { transform:translateX(115vw) scale(1.25); }
+      55% { transform:translateX(5vw) scale(1.35); }
+      100% { transform:translateX(-125vw) scale(1.5); }
+    }
+    @keyframes nightTitleIn {
+      0% { opacity:0; transform:translateY(12px) scale(.98); }
+      100% { opacity:1; transform:translateY(0) scale(1); }
+    }
+    @keyframes nightPulse {
+      0%,100% { opacity:.25; }
+      35% { opacity:.8; }
+      65% { opacity:.45; }
+    }
+    @keyframes moonFloat {
+      0%,100% { transform:translateY(0); }
+      50% { transform:translateY(-8px); }
+    }
+    @media (prefers-reduced-motion:reduce) {
+      .night-cloud, .night-transition-content, .transition-moon, .role-reveal-visual { animation:none !important; }
+      .night-transition-content { opacity:1; transform:none; }
+    }
+
+    .night-action-enter {
+      animation:nightActionEnter .9s cubic-bezier(.2,.7,.2,1) both;
+    }
+    @keyframes nightActionEnter {
+      from { opacity:0; transform:translateY(16px) scale(.985); filter:blur(3px); }
+      to { opacity:1; transform:translateY(0) scale(1); filter:blur(0); }
+    }
+
+    .death-banner {
+      text-align:center;
+      border-color:var(--blood, #e85b65);
+    }
+    .death-banner h2 { color:var(--blood, #e85b65); margin:6px 0; }
+  `;
+  document.head.appendChild(style);
+})();
+
 /* ============ boot ============ */
+document.addEventListener('pointerdown', unlockAudio, { passive:true });
 render();
