@@ -1,16 +1,9 @@
-Cidade Dorme — versão com transição da noite
+Cidade Dorme — configuração de tempos no lobby
 
-Incluído:
-- Revelação do papel por 5 segundos no início de cada rodada.
-- Fade-out da tela de papel.
-- Transição cinematográfica com nuvens escuras cobrindo a tela.
-- Mensagem “A noite chega... cidade dorme”.
-- Sino de meia-noite + chamado de coruja gerados localmente via Web Audio API.
-- Fade-in da tela de ações noturnas.
-- A transição acontece também nas rodadas seguintes, antes de cada noite.
-- Não depende de arquivos de áudio externos.
-- Mantém as imagens locais em assets/roles.
-
-Banco:
-- Não há novas colunas necessárias para esta alteração.
-- Continua usando phase e phase_ends_at já existentes.
+- A tela "Criar uma sala" pede somente o nome.
+- A sala é criada primeiro com os valores padrão.
+- No lobby, somente o anfitrião vê as configurações de tempo.
+- O anfitrião pode alterar discussão e votação enquanto a sala estiver no lobby.
+- Depois do fim da partida, o replay na mesma sala retorna ao lobby e permite escolher novos tempos.
+- Jogadores que não são anfitriões não veem os controles de configuração.
+- Não há alteração de banco necessária para esta mudança.
