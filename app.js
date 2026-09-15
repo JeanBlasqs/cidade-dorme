@@ -230,6 +230,83 @@ const AUDIO_ASSETS = {
   owl: "assets/audio/owl.mp3",
 };
 
+const SESSION_KEY = "cidade-dorme-session-v1";
+
+function saveSession() {
+  try {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        playerId: state.playerId,
+        playerName: state.playerName,
+        roomCode: state.roomCode,
+        isHost: state.isHost,
+      }),
+    );
+  } catch (err) {
+    console.warn("Não foi possível salvar a sessão.", err);
+  }
+}
+function clearSavedSession() {
+  try {
+    localStorage.removeItem(SESSION_KEY);
+  } catch (err) {
+    console.warn("Não foi possível limpar a sessão.", err);
+  }
+}
+function restoreSavedSession() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
+    if (!saved?.playerId || !saved?.roomCode || !saved?.playerName)
+      return false;
+    state.playerId = saved.playerId;
+    state.playerName = saved.playerName;
+    state.roomCode = saved.roomCode;
+    state.isHost = !!saved.isHost;
+    return true;
+  } catch (err) {
+    clearSavedSession();
+    return false;
+  }
+}
+async function restoreRoomAfterRefresh() {
+  if (!state.roomCode) return false;
+  const meta = await dbGetRoom(state.roomCode);
+  if (!meta) {
+    clearSavedSession();
+    Object.assign(state, {
+      screen: "landing",
+      roomCode: null,
+      isHost: false,
+      room: null,
+      players: [],
+    });
+    return false;
+  }
+  const players = await fetchPlayers(state.roomCode);
+  if (!players) return true;
+  const me = players.find((p) => p.id === state.playerId);
+  if (!me) {
+    clearSavedSession();
+    Object.assign(state, {
+      screen: "landing",
+      roomCode: null,
+      isHost: false,
+      room: null,
+      players: [],
+      error: "Sua participação nessa sala não foi encontrada.",
+    });
+    return false;
+  }
+  state.room = meta;
+  state.players = players;
+  state.isHost = meta.hostId === state.playerId;
+  state.screen = meta.status === "lobby" ? "lobby" : "game";
+  state.error = "";
+  saveSession();
+  return true;
+}
+
 /* ============ app state ============ */
 const state = {
   screen: "landing", // landing | create | join | lobby | game
@@ -298,6 +375,7 @@ async function createRoom(name) {
   state.roomCode = code;
   state.isHost = true;
   state.playerName = name;
+  saveSession();
   enterLobby();
 }
 
@@ -345,6 +423,7 @@ async function joinRoom(code, name) {
   state.isHost = meta.hostId === state.playerId;
   state.playerName = name;
   state.error = "";
+  saveSession();
   enterLobby();
 }
 
@@ -1162,6 +1241,7 @@ async function hostReplayRoom() {
 
 function leaveToLanding() {
   stopPolling();
+  clearSavedSession();
   Object.assign(state, {
     screen: "landing",
     roomCode: null,
@@ -1271,7 +1351,6 @@ function render() {
 function renderLanding() {
   const wrap = el(`<div class="wrap">
     <div class="skyline-hero">
-      <div class="skyline-art">${skylineSvg()}</div>
       <div class="hero-copy">
         <h1>CIDADE<br>DORME</h1>
         <p class="hero-kicker">Estratégia, conversa e dedução em uma cidade que nunca dorme.</p>
@@ -1305,7 +1384,7 @@ function renderCreate() {
       <h2>Criar sala</h2>
       <div class="field" style="margin-top:16px;">
         <label for="in-name">Seu nome</label>
-        <input id="in-name" maxlength="18" placeholder="Lucas" autocomplete="off">
+        <input id="in-name" maxlength="18" placeholder="Digite um nome" autocomplete="off">
       </div>
       <button class="btn btn-primary" id="btn-go">Criar sala</button>
       <p class="footnote">Um código será gerado automaticamente.</p>
@@ -1379,14 +1458,33 @@ function renderLobby() {
   const discussionSeconds = state.room?.discussionSeconds || 60;
   const votingSeconds = state.room?.votingSeconds || 45;
 
-  const wrap = el(`<div class="wrap">
-    ${chromeHeader(`Sala: ${esc(state.roomCode || "")}`)}
-    <div class="card">
-      <h3>Jogadores na sala (${players.length}/${MAX_PLAYERS})</h3>
-      <div class="player-list" id="lobby-players" style="margin-top:12px;"></div>
+  const wrap = el(`<div class="wrap lobby-screen">
+    <div class="top-bar">
+      <span class="room-pill">Sala ${esc(state.roomCode || "")}</span>
+      <button class="link-btn" id="btn-leave">Sair</button>
     </div>
-    <div class="card" style="margin-top:12px;">
+
+    <div class="room-code-card">
+      <p class="room-code-label">código da sala</p>
+      <div class="room-code">${esc(state.roomCode || "")}</div>
+      <p class="tagline">Compartilhe esse código com os outros jogadores.</p>
+    </div>
+
+    <div class="lobby-players-heading">
+      <h3>Jogadores (${players.length}/${MAX_PLAYERS})</h3>
+    </div>
+    <div class="player-list" id="lobby-players"></div>
+
+    ${
+      players.length < 4
+        ? `<p class="status-line"><span class="pulse"></span>São necessários pelo menos 4 jogadores para começar.</p>`
+        : `<p class="tagline lobby-role-summary">Com ${players.length} jogadores: 1 assassino, 1 detetive, 1 anjo e ${Math.max(1, players.length - 3)} cidadão(s).</p>`
+    }
+
+    <div class="card lobby-settings" style="margin-top:18px;">
       <h3>Configurações da sala</h3>
+      <p class="tagline" style="margin-top:6px;">O anfitrião pode alterar os tempos enquanto a sala estiver no lobby.</p>
+
       <div class="field" style="margin-top:14px;">
         <label for="discussion-time">Tempo de discussão</label>
         <select id="discussion-time" ${state.isHost ? "" : "disabled"}>
@@ -1398,6 +1496,7 @@ function renderLobby() {
             .join("")}
         </select>
       </div>
+
       <div class="field">
         <label for="voting-time">Tempo de votação</label>
         <select id="voting-time" ${state.isHost ? "" : "disabled"}>
@@ -1409,31 +1508,40 @@ function renderLobby() {
             .join("")}
         </select>
       </div>
-      <p class="footnote" style="text-align:left;margin-top:0;">O anfitrião pode alterar a qualquer tempo.</p>
-      ${
-        state.isHost
-          ? `<button class="btn btn-primary" id="btn-start" ${canStart ? "" : "disabled"}>${state.busy ? "Iniciando..." : "Iniciar jogo"}</button>`
-          : `<p class="waiting-block">Aguardando o anfitrião iniciar o jogo...</p>`
-      }
-      <p class="footnote">É necessário no mínimo 4 jogadores.</p>
-      <p class="error-msg">${esc(state.error)}</p>
-      <button class="link-btn" id="btn-leave" style="width:100%;">Sair da sala</button>
+      <p class="footnote">${state.isHost ? "Você pode mudar essas opções a qualquer momento antes de iniciar." : "Somente o anfitrião pode alterar os tempos."}</p>
     </div>
+
+    <hr class="divider">
+
+    ${
+      state.isHost
+        ? `<button class="btn btn-primary" id="btn-start" ${canStart ? "" : "disabled"}>${state.busy ? "Iniciando..." : "Iniciar jogo"}</button>`
+        : `<p class="waiting-block"><span class="status-dot"></span>Aguardando o anfitrião iniciar o jogo...</p>`
+    }
+    <p class="error-msg">${esc(state.error)}</p>
   </div>`);
 
   const list = wrap.querySelector("#lobby-players");
   players.forEach((p, i) => {
-    const you = p.id === state.playerId ? " (você)" : "";
-    list.appendChild(
-      el(
-        `<div class="player-chip"><span class="num-badge">${i + 1}</span><span>${esc(p.name)}${you}</span><span class="dot"></span></div>`,
-      ),
+    const chip = el(
+      `<div class="player-chip">
+        <span class="num-badge">${i + 1}</span>
+        <span>${esc(p.name)}</span>
+        <span class="dot"></span>
+      </div>`,
     );
+    if (p.id === state.playerId) {
+      chip.appendChild(el(`<span class="you-tag">VOCÊ</span>`));
+    } else if (state.room && p.id === state.room.hostId) {
+      chip.appendChild(el(`<span class="host-tag">anfitrião</span>`));
+    }
+    list.appendChild(chip);
   });
 
   wrap.querySelector("#btn-leave").onclick = leaveToLanding;
   const startBtn = wrap.querySelector("#btn-start");
   if (startBtn) startBtn.onclick = hostStartGame;
+
   const discussionSelect = wrap.querySelector("#discussion-time");
   const votingSelect = wrap.querySelector("#voting-time");
   if (state.isHost) {
@@ -1444,6 +1552,7 @@ function renderLobby() {
     discussionSelect.onchange = saveSettings;
     votingSelect.onchange = saveSettings;
   }
+
   return wrap;
 }
 
@@ -2480,4 +2589,14 @@ document.addEventListener("pointerdown", unlockAudio, { passive: true });
   });
 })();
 
-render();
+(async function boot() {
+  if (restoreSavedSession()) {
+    const restored = await restoreRoomAfterRefresh();
+    if (restored) {
+      render();
+      startPolling();
+      return;
+    }
+  }
+  render();
+})();
