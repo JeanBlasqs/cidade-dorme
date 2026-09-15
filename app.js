@@ -1309,6 +1309,32 @@ function getNextPhaseDuration(meta, phase) {
   return 0;
 }
 
+async function dbClearMatchActions(code) {
+  if (!code) return false;
+
+  const { error: nightError } = await sb
+    .from("night_actions")
+    .delete()
+    .eq("room_code", code);
+
+  if (nightError) {
+    console.error("dbClearMatchActions.night_actions", nightError);
+    return false;
+  }
+
+  const { error: voteError } = await sb
+    .from("votes")
+    .delete()
+    .eq("room_code", code);
+
+  if (voteError) {
+    console.error("dbClearMatchActions.votes", voteError);
+    return false;
+  }
+
+  return true;
+}
+
 async function dbResetPlayersForLobby(code) {
   const { error } = await sb
     .from("players")
@@ -1428,6 +1454,18 @@ async function hostStartGame() {
   if (players.length < 4) {
     state.busy = false;
     state.error = "São necessários pelo menos 4 jogadores para começar.";
+    render();
+    return;
+  }
+
+  // Uma nova partida reutiliza a mesma sala e reinicia a rodada em 1.
+  // Portanto, votos e ações noturnas da partida anterior não podem permanecer,
+  // pois usam room_code + round e seriam interpretados como ações da nova partida.
+  const clearedActions = await dbClearMatchActions(state.roomCode);
+  if (!clearedActions) {
+    state.busy = false;
+    state.error =
+      "Não foi possível limpar as ações da partida anterior. A nova partida não foi iniciada.";
     render();
     return;
   }
@@ -1971,6 +2009,15 @@ async function hostReplayRoom() {
     })
     .eq("room_code", state.roomCode)
     .eq("status", "active");
+  const clearedActions = await dbClearMatchActions(state.roomCode);
+  if (!clearedActions) {
+    state.busy = false;
+    state.error =
+      "Não foi possível limpar as ações da partida anterior. Tente reiniciar novamente.";
+    render();
+    return;
+  }
+
   await dbResetPlayersForLobby(state.roomCode);
 
   // A mesma sala pode receber uma nova partida. Finalizamos as investigações
