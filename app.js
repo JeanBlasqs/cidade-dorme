@@ -662,16 +662,31 @@ async function dbGetMyInvestigationItems(gameId, playerId, playerRole) {
   /*
    * CIDADÃO / ANJO / ASSASSINO
    *
-   * Esses jogadores recebem somente os 3 fatos da rodada 1.
-   *
-   * Como já temos o gameId da investigação correta,
-   * não precisamos procurar novamente uma investigação
-   * "ativa" da rodada 1.
+   * Os 3 fatos são distribuídos somente na rodada 1, mas precisam continuar
+   * visíveis nas telas de revelação das rodadas seguintes. Por isso, não
+   * buscamos mais pelo gameId atual (rodada 2, 3, ...), e sim em todas as
+   * investigações ATIVAS da partida. Como somente a rodada 1 possui fatos,
+   * o jogador recebe sempre os mesmos 3 fatos.
    */
+  const { data: activeGames, error: activeGamesError } = await sb
+    .from("game_investigations")
+    .select("id,round")
+    .eq("room_code", currentGame.room_code)
+    .eq("status", "active")
+    .order("round", { ascending: true });
+
+  if (activeGamesError) {
+    console.error("dbGetMyInvestigationItems.factGames", activeGamesError);
+    return [];
+  }
+
+  const activeGameIds = (activeGames || []).map((game) => game.id);
+  if (!activeGameIds.length) return [];
+
   const { data, error } = await sb
     .from("game_investigation_items")
     .select("id,item_type,text_snapshot,is_true,sort_order,game_id")
-    .eq("game_id", gameId)
+    .in("game_id", activeGameIds)
     .eq("player_id", playerId)
     .eq("item_type", "fact")
     .order("sort_order", { ascending: true });
@@ -1332,6 +1347,32 @@ async function dbClearMatchActions(code) {
     return false;
   }
 
+  // Não basta o DELETE não retornar erro: em caso de policy/RLS inadequada,
+  // o Supabase pode simplesmente não afetar nenhuma linha. Conferimos se
+  // realmente não sobrou ação da sala antes de permitir uma nova partida.
+  const [{ data: remainingNight, error: checkNightError }, { data: remainingVotes, error: checkVoteError }] =
+    await Promise.all([
+      sb.from("night_actions").select("room_code").eq("room_code", code).limit(1),
+      sb.from("votes").select("room_code").eq("room_code", code).limit(1),
+    ]);
+
+  if (checkNightError || checkVoteError) {
+    console.error("dbClearMatchActions.verify", {
+      night: checkNightError,
+      votes: checkVoteError,
+    });
+    return false;
+  }
+
+  if ((remainingNight || []).length || (remainingVotes || []).length) {
+    console.error("dbClearMatchActions: ainda existem ações antigas", {
+      roomCode: code,
+      nightActionsRemaining: (remainingNight || []).length,
+      votesRemaining: (remainingVotes || []).length,
+    });
+    return false;
+  }
+
   return true;
 }
 
@@ -1341,7 +1382,12 @@ async function dbResetPlayersForLobby(code) {
     .update({ alive: true, role: null, ready_round: 0 })
     .eq("room_code", code);
 
-  if (error) console.error("dbResetPlayersForLobby", error);
+  if (error) {
+    console.error("dbResetPlayersForLobby", error);
+    return false;
+  }
+
+  return true;
 }
 
 function startPolling() {
@@ -1805,6 +1851,7 @@ async function advanceToNextNight() {
     .select("id,room_code,round,scenario_id")
     .eq("room_code", state.roomCode)
     .eq("round", nextRound)
+    .eq("status", "active")
     .order("id", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -2018,15 +2065,14 @@ async function hostReplayRoom() {
     return;
   }
 
-  await dbResetPlayersForLobby(state.roomCode);
-
-  // A mesma sala pode receber uma nova partida. Finalizamos as investigações
-  // anteriores para liberar novamente a combinação sala + rodada.
-  await sb
-    .from("game_investigations")
-    .update({ status: "finished", truth_revealed_at: new Date().toISOString() })
-    .eq("room_code", state.roomCode)
-    .eq("status", "active");
+  const resetPlayersOk = await dbResetPlayersForLobby(state.roomCode);
+  if (!resetPlayersOk) {
+    state.busy = false;
+    state.error =
+      "Não foi possível preparar os jogadores para uma nova partida.";
+    render();
+    return;
+  }
 
   const meta = await dbGetRoom(state.roomCode);
 
@@ -2400,14 +2446,19 @@ function renderGame() {
   wrap.querySelector("#btn-leave").onclick = leaveToLanding;
 
   const isNight = meta.phase === "night";
-  const banner = el(`<div class="phase-banner ${isNight ? "night" : "day"}">
-    ${isNight ? moonSvg(38) : sunSvg(38)}
-    <div>
-      <div class="phase-title">${phaseTitle(meta.phase)}</div>
-      <div class="phase-sub">${phaseSubtitle(meta, me)}</div>
-    </div>
-  </div>`);
-  wrap.appendChild(banner);
+  // A própria tela de discussão já possui seu cabeçalho "FASE DE DISCUSSÃO".
+  // Não renderizamos o banner global nessa fase para evitar dois blocos
+  // visualmente repetidos.
+  if (meta.phase !== "day_discussion") {
+    const banner = el(`<div class="phase-banner ${isNight ? "night" : "day"}">
+      ${isNight ? moonSvg(38) : sunSvg(38)}
+      <div>
+        <div class="phase-title">${phaseTitle(meta.phase)}</div>
+        <div class="phase-sub">${phaseSubtitle(meta, me)}</div>
+      </div>
+    </div>`);
+    wrap.appendChild(banner);
+  }
 
   if (!me.alive) {
     wrap.appendChild(renderSpectator(meta, me));
