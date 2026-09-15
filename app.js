@@ -418,6 +418,62 @@ async function dbCreateInvestigationGame(code, round, players) {
     return null;
   }
 
+  // Garantia de integridade: cada jogador que não é Detetive deve ter
+  // exatamente 3 fatos na primeira rodada. Isso protege contra dados antigos
+  // ou uma falha parcial de gravação durante testes/replays.
+  if (Number(round) === 1) {
+    for (const player of players.filter(p => ["cidadao", "anjo", "assassino"].includes(p.role))) {
+      const { data: existingFacts, error: existingFactsError } = await sb
+        .from("game_investigation_items")
+        .select("source_id")
+        .eq("game_id", game.id)
+        .eq("player_id", player.id)
+        .eq("item_type", "fact");
+
+      if (existingFactsError) {
+        console.error("dbCreateInvestigationGame.verifyFacts", existingFactsError);
+        continue;
+      }
+
+      const existingIds = new Set((existingFacts || []).map(f => f.source_id));
+      const missing = Math.max(0, 3 - existingIds.size);
+      if (!missing) continue;
+
+      // Primeiro tenta fatos do próprio papel, depois fatos gerais do cenário.
+      // Nunca repete um fato para o mesmo jogador.
+      const candidates = shuffle([
+        ...(facts || []).filter(f => f.audience === player.role && !existingIds.has(f.id)),
+        ...(facts || []).filter(f => f.audience === "todos" && !existingIds.has(f.id)),
+        ...(facts || []).filter(f => !existingIds.has(f.id)),
+      ]);
+
+      const fallback = [];
+      const used = new Set(existingIds);
+      for (const fact of candidates) {
+        if (used.has(fact.id)) continue;
+        fallback.push({
+          game_id: game.id,
+          player_id: player.id,
+          role: player.role,
+          item_type: "fact",
+          source_id: fact.id,
+          text_snapshot: fact.text,
+          is_true: true,
+          sort_order: existingIds.size + fallback.length + 1,
+        });
+        used.add(fact.id);
+        if (fallback.length >= missing) break;
+      }
+
+      if (fallback.length) {
+        const { error: fallbackError } = await sb
+          .from("game_investigation_items")
+          .insert(fallback);
+        if (fallbackError) console.error("dbCreateInvestigationGame.fallbackFacts", fallbackError);
+      }
+    }
+  }
+
   return game;
 }
 
@@ -479,6 +535,8 @@ async function dbGetMyInvestigationItems(gameId, playerId) {
     .select("id,round")
     .eq("room_code", currentGame.room_code)
     .eq("round", 1)
+    .eq("status", "active")
+    .order("id", { ascending: false })
     .limit(1);
   if (gamesError) {
     console.error("dbGetMyInvestigationItems.initialGame", gamesError);
