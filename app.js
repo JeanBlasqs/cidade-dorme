@@ -194,7 +194,7 @@ function computeRoleCounts(n) {
   // A partir de 4 jogadores existem obrigatoriamente:
   // 1 Assassino + 1 Detetive + 1 Anjo + 1 Cidadão.
   // Acima de 4, todos os demais são cidadãos comuns.
-  return { assassino: 1, detetive: 1, anjo: 1, cidadao: n - 4 };
+  return { assassino: 1, detetive: 1, anjo: 1, cidadao: n - 3 };
 }
 const ROLE_INFO = {
   assassino: {
@@ -697,11 +697,17 @@ async function hostStartGame() {
   state.busy = true;
   render();
 
-  const players = (await fetchPlayers(state.roomCode)) || [];
+  const players = await fetchPlayers(state.roomCode);
+
+  if (!players) {
+    state.busy = false;
+    render();
+    return;
+  }
 
   if (!players.length) {
     state.busy = false;
-    state.error = "Não foi possível carregar os jogadores. Tente de novo.";
+    state.error = "Nenhum jogador foi encontrado na sala.";
     render();
     return;
   }
@@ -719,7 +725,7 @@ async function hostStartGame() {
     "assassino",
     "detetive",
     "anjo",
-    ...Array(Math.max(0, players.length - 4)).fill("cidadao"),
+    ...Array(Math.max(1, players.length - 3)).fill("cidadao"),
   ]);
   const shuffledPlayers = shuffle(players);
 
