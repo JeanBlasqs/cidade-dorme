@@ -7,14 +7,18 @@ function metaFromRow(row){
   return {
     hostId: row.host_id, status: row.status, phase: row.phase, round: row.round,
     log: row.log || [], lastDeathName: row.last_death_name, lastEliminatedName: row.last_eliminated_name,
-    winner: row.winner, discussionSeconds: row.discussion_seconds
+    winner: row.winner, discussionSeconds: row.discussion_seconds || 75,
+    votingSeconds: row.voting_seconds || 30,
+    phaseEndsAt: row.phase_ends_at ? new Date(row.phase_ends_at).getTime() : null
   };
 }
 function rowFromMeta(code, meta){
   return {
     code, host_id: meta.hostId, status: meta.status, phase: meta.phase, round: meta.round,
     log: meta.log, last_death_name: meta.lastDeathName, last_eliminated_name: meta.lastEliminatedName,
-    winner: meta.winner, discussion_seconds: meta.discussionSeconds
+    winner: meta.winner, discussion_seconds: meta.discussionSeconds,
+    voting_seconds: meta.votingSeconds,
+    phase_ends_at: meta.phaseEndsAt ? new Date(meta.phaseEndsAt).toISOString() : null
   };
 }
 async function dbGetRoom(code){
@@ -52,7 +56,7 @@ async function dbSubmitNightAction(code, round, role, playerId, targetId){
 async function dbGetNightActions(code, round, role){
   const { data, error } = await sb.from('night_actions').select('target_id').eq('room_code', code).eq('round', round).eq('role', role);
   if(error){ console.error('dbGetNightActions', error); return []; }
-  return data.map(r => r.target_id);
+  return data.map(r => ({ playerId:r.player_id, targetId:r.target_id }));
 }
 async function dbSubmitVote(code, round, voterId, targetId){
   const { error } = await sb.from('votes').upsert({
@@ -85,15 +89,16 @@ function shuffle(arr){
   return a;
 }
 function computeRoleCounts(n){
-  const assassinos = Math.max(1, Math.floor(n/4));
-  const detetive = n>=4 ? 1 : 0;
-  const anjo = n>=5 ? 1 : 0;
-  const cidadaos = Math.max(0, n - assassinos - detetive - anjo);
-  return { assassino:assassinos, detetive, anjo, cidadao:cidadaos };
+  if(n < 4) return { assassino:0, detetive:0, anjo:0, cidadao:n };
+
+  // A partir de 4 jogadores existem obrigatoriamente:
+  // 1 Assassino + 1 Detetive + 1 Anjo + 1 Cidadão.
+  // Acima de 4, todos os demais são cidadãos comuns.
+  return { assassino:1, detetive:1, anjo:1, cidadao:n-4 };
 }
 const ROLE_INFO = {
   assassino: { glyph:'🔪', name:'Assassino', desc:'Toda noite, você e os outros assassinos escolhem uma vítima para eliminar. De dia, finja ser inocente.' },
-  detetive:  { glyph:'🔎', name:'Detetive', desc:'Toda noite, você pode investigar uma pessoa e descobrir se ela é um assassino.' },
+  detetive:  { glyph:'🔎', name:'Detetive', desc:'Toda noite, você investiga uma pessoa. O resultado indica apenas se ela tem uma função especial ou se é um cidadão comum.' },
   anjo:      { glyph:'🕊️', name:'Anjo', desc:'Toda noite, você escolhe alguém para proteger. Se essa pessoa for atacada, ela sobrevive.' },
   cidadao:   { glyph:'🌾', name:'Cidadão', desc:'Você não tem poderes especiais. Use a conversa e o voto para descobrir quem são os assassinos.' }
 };
@@ -112,7 +117,10 @@ const state = {
   selectedTarget:null,
   pollHandle:null,
   lastPhaseSeen:null,
-  discussionEndsAt:null
+  discussionEndsAt:null,
+  phaseTimerHandle:null,
+  nightResolving:false,
+  autoResolvingVotes:false
 };
 
 /* ============ room meta shape ============
@@ -124,11 +132,14 @@ const state = {
 */
 
 /* ============ core actions ============ */
-async function createRoom(name){
+async function createRoom(name, discussionSeconds=90, votingSeconds=30){
   let code = genRoomCode();
   const meta = {
     hostId: state.playerId, status:'lobby', phase:null, round:0,
-    log:[], lastDeathName:null, lastEliminatedName:null, winner:null, discussionSeconds:75
+    log:[], lastDeathName:null, lastEliminatedName:null, winner:null,
+    discussionSeconds:Number(discussionSeconds)||90,
+    votingSeconds:Number(votingSeconds)||30,
+    phaseEndsAt:null
   };
   await dbCreateRoom(code, meta);
   await dbUpsertPlayer(code, { id: state.playerId, name, alive:true, role:null });
@@ -169,18 +180,81 @@ async function refresh(){
   const players = await fetchPlayers(state.roomCode);
   state.room = meta;
   state.players = players;
-  if(meta.status === 'active' && state.screen !== 'game'){
+  if(meta.status === 'lobby' && state.screen === 'game'){
+    state.screen = 'lobby';
+    state.selectedTarget = null;
+    state.lastPhaseSeen = null;
+  } else if(meta.status === 'active' && state.screen !== 'game'){
     state.screen = 'game';
     state.selectedTarget = null;
   }
+
   if(meta.phase !== state.lastPhaseSeen){
     state.selectedTarget = null;
-    if(meta.phase === 'day_discussion'){
-      state.discussionEndsAt = Date.now() + (meta.discussionSeconds||75)*1000;
-    }
     state.lastPhaseSeen = meta.phase;
   }
+
   render();
+
+  if(meta.phase === 'night') tryAutoResolveNight();
+  if(meta.phase === 'day_discussion' || meta.phase === 'day_voting') startPhaseTimer(meta);
+}
+
+function formatSeconds(total){
+  total = Number(total)||0;
+  if(total < 60) return `${total}s`;
+  const m = Math.floor(total/60), s = total%60;
+  return s ? `${m}m ${s}s` : `${m} min`;
+}
+
+function formatTimer(ms){
+  const remain = Math.max(0, Math.ceil(ms/1000));
+  const m = String(Math.floor(remain/60)).padStart(2,'0');
+  const s = String(remain%60).padStart(2,'0');
+  return `${m}:${s}`;
+}
+
+function startPhaseTimer(meta){
+  clearTimeout(state.phaseTimerHandle);
+  if(!meta.phaseEndsAt) return;
+
+  const check = async ()=>{
+    const remain = meta.phaseEndsAt - Date.now();
+
+    if(remain > 0){
+      state.phaseTimerHandle = setTimeout(check, Math.min(remain, 500));
+      return;
+    }
+
+    if(meta.phase === 'day_discussion'){
+      await dbAdvancePhase(state.roomCode, 'day_discussion', 'day_voting');
+    } else if(meta.phase === 'day_voting'){
+      await autoResolveVotes();
+    }
+  };
+
+  check();
+}
+
+async function dbAdvancePhase(code, fromPhase, toPhase){
+  const votingSeconds = state.room?.votingSeconds || 30;
+
+  const { error } = await sb.from('rooms').update({
+    phase: toPhase,
+    phase_ends_at: toPhase === 'day_voting'
+      ? new Date(Date.now() + votingSeconds*1000).toISOString()
+      : null
+  }).eq('code', code).eq('phase', fromPhase);
+
+  if(error) console.error('dbAdvancePhase', error);
+}
+
+async function dbResetPlayersForLobby(code){
+  const { error } = await sb.from('players')
+    .update({ alive:true, role:null })
+    .eq('room_code', code);
+
+  if(error) console.error('dbResetPlayersForLobby', error);
 }
 
 function startPolling(){
@@ -191,6 +265,8 @@ function startPolling(){
 }
 function stopPolling(){
   if(state.pollHandle){ clearInterval(state.pollHandle); state.pollHandle=null; }
+  clearTimeout(state.phaseTimerHandle);
+  state.phaseTimerHandle=null;
   if(state.channel){ sb.removeChannel(state.channel); state.channel=null; }
 }
 function subscribeRealtime(code){
@@ -221,7 +297,8 @@ async function hostStartGame(){
   const meta = await dbGetRoom(state.roomCode);
   meta.status = 'active';
   meta.phase = 'night';
-  meta.round = 1;
+  meta.round = (meta.round || 0) + 1;
+  meta.phaseEndsAt = null;
   meta.log = [`A cidade adormece pela primeira vez... (Rodada 1)`];
   meta.winner = null;
   await dbUpdateRoom(state.roomCode, meta);
@@ -244,6 +321,7 @@ async function submitSeerPick(targetId){
   await dbSubmitNightAction(state.roomCode, state.room.round, 'detetive', state.playerId, targetId);
   state.selectedTarget = targetId;
   render();
+  tryAutoResolveNight();
 }
 
 function tally(counts){
@@ -255,6 +333,34 @@ function tally(counts){
   return { winner: tie? null : best, tie };
 }
 
+async function tryAutoResolveNight(){
+  if(state.nightResolving || !state.room || state.room.phase !== 'night') return;
+
+  const players = await fetchPlayers(state.roomCode);
+  const required = players.filter(
+    p => p.alive && ['assassino','anjo','detetive'].includes(p.role)
+  );
+
+  if(!required.length) return;
+
+  const actions = [];
+  for(const role of ['assassino','anjo','detetive']){
+    const rows = await dbGetNightActions(state.roomCode, state.room.round, role);
+    actions.push(...rows);
+  }
+
+  const acted = new Set(actions.map(a => a.playerId));
+
+  if(required.some(p => !acted.has(p.id))) return;
+
+  state.nightResolving = true;
+  try {
+    await hostResolveNight();
+  } finally {
+    state.nightResolving = false;
+  }
+}
+
 async function hostResolveNight(){
   if(state.busy) return;
   state.busy = true; render();
@@ -263,7 +369,9 @@ async function hostResolveNight(){
   const aliveAssassinos = players.filter(p=>p.alive && p.role==='assassino');
   const assassinoVotes = await dbGetNightActions(state.roomCode, round, 'assassino');
   const counts = {};
-  assassinoVotes.forEach(v=>{ if(v) counts[v] = (counts[v]||0)+1; });
+  assassinoVotes.forEach(a=>{
+    if(a.targetId) counts[a.targetId] = (counts[a.targetId]||0)+1;
+  });
   let victimId = null;
   if(Object.keys(counts).length){
     const t = tally(counts);
@@ -274,7 +382,7 @@ async function hostResolveNight(){
     if(targets.length) victimId = targets[Math.floor(Math.random()*targets.length)].id;
   }
   const anjoPicks = await dbGetNightActions(state.roomCode, round, 'anjo');
-  const anjoPick = anjoPicks[0] || null;
+  const anjoPick = anjoPicks[0]?.targetId || null;
   let deathName = null;
   if(victimId && victimId !== anjoPick){
     const victim = players.find(p=>p.id===victimId);
@@ -286,6 +394,7 @@ async function hostResolveNight(){
   const updatedPlayers = await fetchPlayers(state.roomCode);
   const meta = await dbGetRoom(state.roomCode);
   meta.lastDeathName = deathName;
+  meta.phaseEndsAt = null;
   meta.log.push(deathName ? `🌅 Ao amanhecer, ${deathName} foi encontrado(a) sem vida.` : `🌅 A cidade acorda e, surpreendentemente, ninguém morreu esta noite.`);
   const win = checkWinner(updatedPlayers);
   if(win){
@@ -312,12 +421,7 @@ function checkWinner(players){
 async function hostGoToDiscussion(){
   const meta = await dbGetRoom(state.roomCode);
   meta.phase = 'day_discussion';
-  await dbUpdateRoom(state.roomCode, meta);
-  refresh();
-}
-async function hostGoToVoting(){
-  const meta = await dbGetRoom(state.roomCode);
-  meta.phase = 'day_voting';
+  meta.phaseEndsAt = Date.now() + (meta.discussionSeconds||90)*1000;
   await dbUpdateRoom(state.roomCode, meta);
   refresh();
 }
@@ -326,8 +430,19 @@ async function submitVote(targetId){
   state.selectedTarget = targetId;
   render();
 }
+async function autoResolveVotes(){
+  if(state.busy || !state.room || state.room.phase !== 'day_voting') return;
+
+  state.autoResolvingVotes = true;
+  try {
+    await hostResolveVotes();
+  } finally {
+    state.autoResolvingVotes = false;
+  }
+}
+
 async function hostResolveVotes(){
-  if(state.busy) return;
+  if(state.busy && !state.autoResolvingVotes) return;
   state.busy = true; render();
   const round = state.room.round;
   const players = await fetchPlayers(state.roomCode);
@@ -348,6 +463,7 @@ async function hostResolveVotes(){
   const updatedPlayers = await fetchPlayers(state.roomCode);
   const meta = await dbGetRoom(state.roomCode);
   meta.lastEliminatedName = eliminatedName;
+  meta.phaseEndsAt = null;
   meta.log.push(eliminatedName ? `🗳️ A cidade votou e eliminou ${eliminatedName}.` : `🗳️ Os votos empataram — ninguém foi eliminado.`);
   const win = checkWinner(updatedPlayers);
   if(win){
@@ -367,6 +483,32 @@ async function hostNextNight(){
   meta.phase = 'night';
   meta.log.push(`🌙 A cidade dorme novamente... (Rodada ${meta.round})`);
   await dbUpdateRoom(state.roomCode, meta);
+  refresh();
+}
+
+async function hostReplayRoom(){
+  if(!state.isHost || state.busy) return;
+
+  state.busy = true;
+
+  await dbResetPlayersForLobby(state.roomCode);
+
+  const meta = await dbGetRoom(state.roomCode);
+
+  if(meta){
+    meta.status = 'lobby';
+    meta.phase = null;
+    meta.winner = null;
+    meta.lastDeathName = null;
+    meta.lastEliminatedName = null;
+    meta.phaseEndsAt = null;
+    meta.log = ['A sala foi reiniciada. Todos podem jogar novamente.'];
+    await dbUpdateRoom(state.roomCode, meta);
+  }
+
+  state.busy = false;
+  state.screen = 'lobby';
+  state.lastPhaseSeen = null;
   refresh();
 }
 
@@ -457,6 +599,26 @@ function renderCreate(){
           <label for="in-name">Seu nome</label>
           <input id="in-name" maxlength="18" placeholder="Como quer ser chamado(a)?" autocomplete="off">
         </div>
+        <div class="field">
+          <label for="in-discussion">Tempo de discussão</label>
+          <select id="in-discussion">
+            <option value="30">30 segundos</option>
+            <option value="60">1 minuto</option>
+            <option value="90" selected>1 minuto e 30 segundos</option>
+            <option value="120">2 minutos</option>
+            <option value="180">3 minutos</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="in-voting">Tempo de votação</label>
+          <select id="in-voting">
+            <option value="15">15 segundos</option>
+            <option value="30" selected>30 segundos</option>
+            <option value="60">1 minuto</option>
+            <option value="90">1 minuto e 30 segundos</option>
+            <option value="120">2 minutos</option>
+          </select>
+        </div>
         <button class="btn btn-primary" id="btn-go">Criar sala</button>
         <p class="error-msg">${esc(state.error)}</p>
       </div>
@@ -468,7 +630,9 @@ function renderCreate(){
     const name = input.value.trim();
     if(!name){ state.error='Digite um nome.'; render(); return; }
     state.error='';
-    await createRoom(name);
+    const discussionSeconds = Number(wrap.querySelector('#in-discussion').value);
+    const votingSeconds = Number(wrap.querySelector('#in-voting').value);
+    await createRoom(name, discussionSeconds, votingSeconds);
   };
   input.addEventListener('keydown', e=>{ if(e.key==='Enter') wrap.querySelector('#btn-go').click(); });
   wrap.querySelector('#btn-back').onclick = ()=>{ state.screen='landing'; render(); };
@@ -524,7 +688,8 @@ function renderLobby(){
     <h3 style="margin:22px 0 12px;">Jogadores (${players.length})</h3>
     <div class="player-list" id="lobby-players"></div>
     ${players.length < 4 ? `<p class="status-line"><span class="pulse"></span>São necessários pelo menos 4 jogadores para começar.</p>` : ''}
-    ${players.length>=4 ? `<p class="tagline">Com ${players.length} jogadores: ${counts.assassino} assassino(s)${counts.detetive?', 1 detetive':''}${counts.anjo?', 1 anjo':''}, ${counts.cidadao} cidadão(s).</p>` : ''}
+    ${players.length>=4 ? `<p class="tagline">Com ${players.length} jogadores: 1 assassino, 1 detetive, 1 anjo e ${counts.cidadao} cidadão(s).</p>` : ''}
+    ${state.room ? `<p class="tagline" style="margin-top:8px;">Discussão: ${formatSeconds(state.room.discussionSeconds)} · Votação: ${formatSeconds(state.room.votingSeconds)}</p>` : ''}
     <hr class="divider">
     ${state.isHost
       ? `<button class="btn btn-primary" id="btn-start" ${canStart?'':'disabled'}>Iniciar jogo</button>`
@@ -610,7 +775,8 @@ function renderSpectator(meta, me){
   return el(`<div class="card">
     <div class="waiting-block">
       <span class="glyph">👻</span>
-      <p>Você foi eliminado(a). Seu papel era <strong style="color:var(--ink)">${ROLE_INFO[me.role].name}</strong>.</p>
+      <p>Você morreu e foi eliminado(a) da partida.</p>
+       <p style="margin-top:8px;">Seu papel era <strong style="color:var(--ink)">${ROLE_INFO[me.role]?.name || 'não identificado'}</strong>.</p>
       <p style="margin-top:8px;">Continue acompanhando em silêncio até o fim da partida.</p>
     </div>
   </div>`);
@@ -688,13 +854,7 @@ function renderNightPanel(meta, me){
     card.appendChild(box);
   }
 
-  if(state.isHost){
-    card.appendChild(el(`<hr class="divider">`));
-    const btn = el(`<button class="btn btn-ghost" id="btn-resolve-night">Resolver a noite (anfitrião)</button>`);
-    btn.onclick = hostResolveNight;
-    card.appendChild(btn);
-    card.appendChild(el(`<p class="footnote">Use quando todos os papéis noturnos já tiverem agido.</p>`));
-  }
+  card.appendChild(el(`<p class="footnote">A noite termina automaticamente quando todos os papéis especiais vivos fizerem sua escolha.</p>`));
   return card;
 }
 
@@ -717,47 +877,58 @@ function renderDiscussion(meta, me){
       <p class="tagline">Conversem em voz alta sobre quem parece suspeito.</p>
       <h2 id="timer-display" style="margin-top:14px; color:var(--lantern-soft);">--:--</h2>
     </div>
-    ${state.isHost ? `<button class="btn btn-primary" id="btn-to-voting">Ir para a votação</button>` : ''}
+    <p class="footnote">A discussão termina automaticamente. Depois começa a votação.</p>
   </div>`);
+
   const disp = card.querySelector('#timer-display');
-  function tick(){
-    const remain = Math.max(0, Math.round((state.discussionEndsAt - Date.now())/1000));
-    const m = String(Math.floor(remain/60)).padStart(2,'0');
-    const s = String(remain%60).padStart(2,'0');
-    disp.textContent = `${m}:${s}`;
-    if(remain<=0) clearInterval(iv);
-  }
-  const iv = setInterval(tick, 500);
+  const tick = ()=>{
+    disp.textContent = formatTimer((meta.phaseEndsAt || Date.now()) - Date.now());
+  };
+
+  const iv = setInterval(()=>{
+    tick();
+    if(meta.phaseEndsAt && meta.phaseEndsAt <= Date.now()) clearInterval(iv);
+  }, 250);
+
   tick();
-  const btn = card.querySelector('#btn-to-voting');
-  if(btn) btn.onclick = ()=>{ clearInterval(iv); hostGoToVoting(); };
   return card;
 }
 
 function renderVoting(meta, me){
   const alivePlayers = (state.players||[]).filter(p=>p.alive);
+
   const box = el(`<div class="card">
     <h3>🗳️ Em quem você vota?</h3>
+    <h2 id="vote-timer" style="text-align:center; margin:12px 0; color:var(--lantern-soft);">--:--</h2>
     <div class="target-grid" id="vote-targets" style="margin-top:14px;"></div>
-    <button class="target-btn" id="vote-abstain" style="margin-top:4px;">Abster-se</button>
+    <button class="target-btn" id="vote-abstain" style="margin-top:4px;">Pular</button>
+    <p class="footnote">A votação termina automaticamente quando o tempo acabar.</p>
   </div>`);
+
   const grid = box.querySelector('#vote-targets');
+
   alivePlayers.filter(p=>p.id!==me.id).forEach(t=>{
     const b = el(`<button class="target-btn">${esc(t.name)}</button>`);
     if(state.selectedTarget===t.id) b.classList.add('selected');
     b.onclick = ()=>submitVote(t.id);
     grid.appendChild(b);
   });
+
   const abstainBtn = box.querySelector('#vote-abstain');
   if(state.selectedTarget==='abstain') abstainBtn.classList.add('selected');
   abstainBtn.onclick = ()=>submitVote('abstain');
 
-  if(state.isHost){
-    box.appendChild(el(`<hr class="divider">`));
-    const btn = el(`<button class="btn btn-ghost" id="btn-resolve-votes">Apurar votos (anfitrião)</button>`);
-    btn.onclick = hostResolveVotes;
-    box.appendChild(btn);
-  }
+  const timer = box.querySelector('#vote-timer');
+  const tick = ()=>{
+    timer.textContent = formatTimer((meta.phaseEndsAt || Date.now()) - Date.now());
+  };
+
+  const iv = setInterval(()=>{
+    tick();
+    if(meta.phaseEndsAt && meta.phaseEndsAt <= Date.now()) clearInterval(iv);
+  }, 250);
+
+  tick();
   return box;
 }
 
@@ -788,16 +959,21 @@ function renderGameOver(){
         <h3 style="margin-bottom:12px;">Todos os papéis</h3>
         <div class="player-list" id="final-roles"></div>
       </div>
-      <button class="btn btn-ghost" id="btn-newgame">Voltar ao início</button>
+      ${state.isHost
+        ? `<button class="btn btn-primary" id="btn-replay">Jogar novamente nesta sala</button>`
+        : `<p class="waiting-block"><span class="glyph">🕯️</span>Aguardando o anfitrião iniciar uma nova partida nesta sala...</p>`}
+      <button class="btn btn-ghost" id="btn-newgame">Sair da sala</button>
     </div>
   </div>`);
   const list = wrap.querySelector('#final-roles');
   (state.players||[]).forEach(p=>{
-    const info = ROLE_INFO[p.role] || ROLE_INFO.cidadao;
+    const info = ROLE_INFO[p.role] || { glyph:'❓', name:'Papel não atribuído' };
     const chip = el(`<div class="player-chip ${p.alive?'':'dead'}"><span class="dot"></span><span>${esc(p.name)} — ${info.glyph} ${info.name}</span></div>`);
     list.appendChild(chip);
   });
   wrap.querySelector('#btn-newgame').onclick = leaveToLanding;
+  const replayBtn = wrap.querySelector('#btn-replay');
+  if(replayBtn) replayBtn.onclick = hostReplayRoom;
   return wrap;
 }
 
