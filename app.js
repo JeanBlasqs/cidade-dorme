@@ -2,7 +2,22 @@
 const SUPABASE_URL = "https://umozumbmjfjdmmppelwa.supabase.co";
 const SUPABASE_ANON_KEY =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVtb3p1bWJtamZqZG1tcHBlbHdhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk0MjA2MjAsImV4cCI6MjEwNDk5NjYyMH0.t01eyAh46XaeIP85ch-aSvjMmlGfEE92UiH2hSEM7K8";
-const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const MAX_PLAYERS = 10;
+const sb = window.supabase
+  ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+      global: {
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: "Bearer " + SUPABASE_ANON_KEY,
+        },
+      },
+    })
+  : null;
 
 function metaFromRow(row) {
   return {
@@ -14,8 +29,8 @@ function metaFromRow(row) {
     lastDeathName: row.last_death_name,
     lastEliminatedName: row.last_eliminated_name,
     winner: row.winner,
-    discussionSeconds: row.discussion_seconds || 75,
-    votingSeconds: row.voting_seconds || 30,
+    discussionSeconds: row.discussion_seconds || 60,
+    votingSeconds: row.voting_seconds || 45,
     phaseEndsAt: row.phase_ends_at
       ? new Date(row.phase_ends_at).getTime()
       : null,
@@ -40,6 +55,7 @@ function rowFromMeta(code, meta) {
   };
 }
 async function dbGetRoom(code) {
+  if (!sb) return null;
   const { data, error } = await sb
     .from("rooms")
     .select("*")
@@ -75,21 +91,27 @@ async function dbUpsertPlayer(code, player) {
   if (error) console.error("dbUpsertPlayer", error);
 }
 async function dbFetchPlayers(code) {
-  const { data, error } = await sb
+  if (!sb) return [];
+  let { data, error } = await sb
     .from("players")
     .select("*")
     .eq("room_code", code)
     .order("joined_at");
   if (error) {
-    console.error("dbFetchPlayers", error);
-    return [];
+    console.error("ERRO AO BUSCAR PLAYERS:", error);
+    console.error("Código:", error.code);
+    console.error("Mensagem:", error.message);
+    console.error("Detalhes:", error.details);
+    console.error("Hint:", error.hint);
+    state.error = `Erro ao carregar jogadores: ${error.message}`;
+    return null;
   }
-  return data.map((r) => ({
+  return (data || []).map((r) => ({
     id: r.id,
     name: r.name,
     alive: r.alive,
     role: r.role,
-    joinedAt: new Date(r.joined_at).getTime(),
+    joinedAt: r.joined_at ? new Date(r.joined_at).getTime() : 0,
   }));
 }
 async function dbSubmitNightAction(code, round, role, playerId, targetId) {
@@ -234,6 +256,12 @@ const state = {
   phaseClientDeadline: null,
   lastDataSignature: null,
   lastRenderedPhase: null,
+  chat: [],
+  showInvestigation: false,
+  nightRoleDone: { assassino: false, detetive: false, anjo: false },
+  refreshInFlight: false,
+  refreshQueued: false,
+  refreshTimer: null,
 };
 
 /* ============ room meta shape ============
@@ -256,8 +284,8 @@ async function createRoom(name) {
     lastDeathName: null,
     lastEliminatedName: null,
     winner: null,
-    discussionSeconds: 90,
-    votingSeconds: 30,
+    discussionSeconds: 60,
+    votingSeconds: 45,
     phaseEndsAt: null,
   };
   await dbCreateRoom(code, meta);
@@ -301,6 +329,12 @@ async function joinRoom(code, name) {
     render();
     return;
   }
+  const already = (await fetchPlayers(code)) || [];
+  if (already.length >= MAX_PLAYERS) {
+    state.error = "Essa sala já está cheia.";
+    render();
+    return;
+  }
   await dbUpsertPlayer(code, {
     id: state.playerId,
     name,
@@ -327,11 +361,31 @@ async function fetchPlayers(code) {
 
 async function refresh() {
   if (!state.roomCode) return;
+  if (state.refreshInFlight) {
+    state.refreshQueued = true;
+    return;
+  }
+  state.refreshInFlight = true;
+  try {
+    await refreshOnce();
+  } catch (err) {
+    console.error("refresh", err);
+  } finally {
+    state.refreshInFlight = false;
+    if (state.refreshQueued) {
+      state.refreshQueued = false;
+      refresh();
+    }
+  }
+}
+
+async function refreshOnce() {
+  if (!state.roomCode) return;
 
   const meta = await dbGetRoom(state.roomCode);
   if (!meta) return;
 
-  const players = await fetchPlayers(state.roomCode);
+  const players = (await fetchPlayers(state.roomCode)) || [];
   const previousPhase = state.lastPhaseSeen;
 
   state.room = meta;
@@ -358,6 +412,11 @@ async function refresh() {
     state.lastPhaseSeen = meta.phase;
 
     if (meta.phase === "night") state.nightEnteredAt = Date.now();
+    if (meta.phase !== "night") {
+      state.showInvestigation = false;
+      state.nightRoleDone = { assassino: false, detetive: false, anjo: false };
+    }
+    if (meta.phase === "day_discussion") state.chat = [];
 
     // Cada navegador inicia o relógio visual no momento em que recebe a fase.
     // Isso evita diferenças causadas pelo relógio local dos aparelhos.
@@ -419,7 +478,8 @@ async function refresh() {
   ) {
     if (phaseChanged || !state.phaseTimerHandle) startPhaseTimer(meta);
   } else if (meta.phase === "night") {
-    tryAutoResolveNight();
+    await loadNightProgress();
+    if (state.isHost) tryAutoResolveNight();
   }
 }
 
@@ -549,7 +609,7 @@ function startPolling() {
   stopPolling();
   refresh();
   subscribeRealtime(state.roomCode);
-  state.pollHandle = setInterval(refresh, 4000); // reforço, caso o realtime perca algum evento
+  state.pollHandle = setInterval(refresh, 8000);
 }
 function stopPolling() {
   if (state.pollHandle) {
@@ -558,12 +618,19 @@ function stopPolling() {
   }
   clearTimeout(state.phaseTimerHandle);
   state.phaseTimerHandle = null;
-  if (state.channel) {
+  clearTimeout(state.refreshTimer);
+  state.refreshTimer = null;
+  if (state.channel && sb) {
     sb.removeChannel(state.channel);
     state.channel = null;
   }
 }
+function scheduleRefresh() {
+  clearTimeout(state.refreshTimer);
+  state.refreshTimer = setTimeout(refresh, 280);
+}
 function subscribeRealtime(code) {
+  if (!sb) return;
   state.channel = sb
     .channel("room-" + code)
     .on(
@@ -574,7 +641,7 @@ function subscribeRealtime(code) {
         table: "rooms",
         filter: `code=eq.${code}`,
       },
-      refresh,
+      scheduleRefresh,
     )
     .on(
       "postgres_changes",
@@ -584,7 +651,7 @@ function subscribeRealtime(code) {
         table: "players",
         filter: `room_code=eq.${code}`,
       },
-      refresh,
+      scheduleRefresh,
     )
     .on(
       "postgres_changes",
@@ -594,7 +661,7 @@ function subscribeRealtime(code) {
         table: "night_actions",
         filter: `room_code=eq.${code}`,
       },
-      refresh,
+      scheduleRefresh,
     )
     .on(
       "postgres_changes",
@@ -604,8 +671,18 @@ function subscribeRealtime(code) {
         table: "votes",
         filter: `room_code=eq.${code}`,
       },
-      refresh,
+      scheduleRefresh,
     )
+    .on("broadcast", { event: "chat" }, (msg) => {
+      const payload = msg.payload || {};
+      if (!payload.text) return;
+      if (state.chat.some((m) => m.id === payload.id && m.t === payload.t))
+        return;
+      state.chat.push(payload);
+      if (state.screen === "game" && state.room?.phase === "day_discussion") {
+        render();
+      }
+    })
     .subscribe();
 }
 
@@ -620,7 +697,14 @@ async function hostStartGame() {
   state.busy = true;
   render();
 
-  const players = await fetchPlayers(state.roomCode);
+  const players = (await fetchPlayers(state.roomCode)) || [];
+
+  if (!players.length) {
+    state.busy = false;
+    state.error = "Não foi possível carregar os jogadores. Tente de novo.";
+    render();
+    return;
+  }
 
   if (players.length < 4) {
     state.busy = false;
@@ -742,8 +826,8 @@ async function tryAutoResolveNight() {
   if (state.nightResolving || !state.room || state.room.phase !== "night")
     return;
 
-  const players = await fetchPlayers(state.roomCode);
-
+  const players = (await fetchPlayers(state.roomCode)) || [];
+  if (!players.length) return;
   const required = players.filter(
     (p) => p.alive && ["assassino", "anjo", "detetive"].includes(p.role),
   );
@@ -771,6 +855,33 @@ async function tryAutoResolveNight() {
     await hostResolveNight();
   } finally {
     state.nightResolving = false;
+  }
+}
+
+async function loadNightProgress() {
+  if (!state.room) return;
+  const done = { assassino: false, detetive: false, anjo: false };
+  for (const role of ["assassino", "detetive", "anjo"]) {
+    const rows = await dbGetNightActions(
+      state.roomCode,
+      state.room.round,
+      role,
+    );
+    done[role] = rows.length > 0;
+  }
+  state.nightRoleDone = done;
+}
+
+async function sendChat(text) {
+  const payload = {
+    id: state.playerId,
+    name: state.playerName || "Jogador",
+    text,
+    t: Date.now(),
+  };
+  state.chat.push(payload);
+  if (state.channel) {
+    await state.channel.send({ type: "broadcast", event: "chat", payload });
   }
 }
 
@@ -1072,10 +1183,46 @@ function esc(s) {
   return d.innerHTML;
 }
 
+function skylineSvg() {
+  return `<svg class="skyline-svg" viewBox="0 0 400 220" preserveAspectRatio="xMidYEnd slice" aria-hidden="true">
+    <defs>
+      <linearGradient id="glow" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#f6d48a" stop-opacity=".9"/>
+        <stop offset="1" stop-color="#f0b429" stop-opacity=".05"/>
+      </linearGradient>
+    </defs>
+    <circle cx="200" cy="58" r="28" fill="#f6d48a"/>
+    <circle cx="188" cy="50" r="22" fill="#141a48"/>
+    <g fill="#0b1028">
+      <rect x="0" y="128" width="38" height="92"/>
+      <rect x="36" y="108" width="42" height="112"/>
+      <rect x="78" y="92" width="36" height="128"/>
+      <rect x="112" y="118" width="48" height="102"/>
+      <rect x="156" y="84" width="28" height="136"/>
+      <polygon points="184,84 198,52 212,84"/>
+      <rect x="210" y="100" width="54" height="120"/>
+      <rect x="262" y="74" width="32" height="146"/>
+      <rect x="292" y="112" width="46" height="108"/>
+      <rect x="336" y="90" width="64" height="130"/>
+    </g>
+    <g fill="#f4c056" opacity=".75">
+      <rect x="46" y="120" width="4" height="6"/><rect x="56" y="132" width="4" height="6"/>
+      <rect x="86" y="108" width="4" height="6"/><rect x="96" y="124" width="4" height="6"/>
+      <rect x="168" y="110" width="4" height="6"/><rect x="222" y="118" width="4" height="6"/>
+      <rect x="236" y="136" width="4" height="6"/><rect x="270" y="96" width="4" height="6"/>
+      <rect x="348" y="108" width="4" height="6"/><rect x="362" y="128" width="4" height="6"/>
+    </g>
+    <rect x="0" y="200" width="400" height="20" fill="#080c22"/>
+  </svg>`;
+}
 function moonSvg(size = 44) {
   return `<svg width="${size}" height="${size}" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M30 6C20 8 13 17 13 27c0 11 9 20 20 20 5 0 9.5-1.8 13-4.8C40.5 45 33.7 48 26 48 12.7 48 2 37.3 2 24S12.7 0 26 0c1.4 0 2.7.1 4 .3-1.4 1.7-2 3.7 0 5.7z" fill="#f2c078" transform="translate(4,0) scale(0.85)"/>
   </svg>`;
+}
+
+function chromeHeader(right = "") {
+  return `<div class="cd-header"><div class="cd-logo">${moonSvg(18)} CIDADE DORME</div><div class="cd-meta">${right}</div></div>`;
 }
 function sunSvg(size = 44) {
   return `<svg width="${size}" height="${size}" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -1117,20 +1264,19 @@ function render() {
 
 function renderLanding() {
   const wrap = el(`<div class="wrap">
-    <div class="center-stage">
-      <div>
-        <div class="brand">${moonSvg(40)}<h1>Cidade Dorme</h1></div>
-        <p class="tagline">Um jogo de dedução social. Descubra os assassinos antes que seja tarde — ou disfarce-se entre os cidadãos.</p>
-      </div>
-      <div class="card">
-        <div class="choice-row">
-          <button class="choice" id="btn-create"><span class="glyph">🏮</span><span class="label">Criar sala</span></button>
-          <button class="choice" id="btn-join"><span class="glyph">🚪</span><span class="label">Entrar em sala</span></button>
+    <div class="skyline-hero">
+      <div class="skyline-art">${skylineSvg()}</div>
+      <div class="hero-copy">
+        <h1>CIDADE<br>DORME</h1>
+        <p class="hero-kicker">Estratégia, conversa e dedução em uma cidade que nunca dorme.</p>
+        <div class="hero-actions">
+          <button class="btn btn-primary" id="btn-create">Criar sala</button>
+          <button class="btn btn-ghost" id="btn-join">Entrar na sala</button>
         </div>
-        <p class="footnote" style="margin-top:0;">Jogue com 4 ou mais pessoas, cada uma no seu próprio celular.</p>
+        <p class="error-msg">${esc(state.error || (!sb ? "Falha ao carregar o jogo. Recarregue a página." : ""))}</p>
+        <p class="hero-foot">Mesmas pessoas. Novas histórias.</p>
       </div>
     </div>
-    <p class="footnote">Papéis: Assassino 🔪 · Cidadão 🌾 · Detetive 🔎 · Anjo 🕊️</p>
   </div>`);
   wrap.querySelector("#btn-create").onclick = () => {
     state.screen = "create";
@@ -1147,18 +1293,17 @@ function renderLanding() {
 
 function renderCreate() {
   const wrap = el(`<div class="wrap">
-    <div class="center-stage">
-      <div class="brand">${moonSvg(34)}<h2>Criar uma sala</h2></div>
-      <div class="card">
-        <div class="field">
-          <label for="in-name">Seu nome</label>
-          <input id="in-name" maxlength="18" placeholder="Como quer ser chamado(a)?" autocomplete="off">
-        </div>
-        <p class="tagline" style="margin:14px 0 0;">Os tempos da partida são definidos depois, no lobby, somente pelo anfitrião.</p>
-        <button class="btn btn-primary" id="btn-go">Criar sala</button>
-        <p class="error-msg">${esc(state.error)}</p>
+    ${chromeHeader()}
+    <button class="link-btn" id="btn-back">← Voltar</button>
+    <div class="card" style="margin-top:8px;">
+      <h2>Criar sala</h2>
+      <div class="field" style="margin-top:16px;">
+        <label for="in-name">Seu nome</label>
+        <input id="in-name" maxlength="18" placeholder="Lucas" autocomplete="off">
       </div>
-      <button class="link-btn" id="btn-back">← Voltar</button>
+      <button class="btn btn-primary" id="btn-go">Criar sala</button>
+      <p class="footnote">Um código será gerado automaticamente.</p>
+      <p class="error-msg">${esc(state.error)}</p>
     </div>
   </div>`);
   const input = wrap.querySelector("#in-name");
@@ -1184,21 +1329,20 @@ function renderCreate() {
 
 function renderJoin() {
   const wrap = el(`<div class="wrap">
-    <div class="center-stage">
-      <div class="brand">${moonSvg(34)}<h2>Entrar em uma sala</h2></div>
-      <div class="card">
-        <div class="field">
-          <label for="in-code">Código da sala</label>
-          <input id="in-code" class="code-input" maxlength="5" placeholder="XXXXX" autocomplete="off">
-        </div>
-        <div class="field">
-          <label for="in-name2">Seu nome</label>
-          <input id="in-name2" maxlength="18" placeholder="Como quer ser chamado(a)?" autocomplete="off">
-        </div>
-        <button class="btn btn-primary" id="btn-go2">Entrar</button>
-        <p class="error-msg">${esc(state.error)}</p>
+    ${chromeHeader()}
+    <button class="link-btn" id="btn-back2">← Voltar</button>
+    <div class="card" style="margin-top:8px;">
+      <h2>Entrar na sala</h2>
+      <div class="field" style="margin-top:16px;">
+        <label for="in-code">Código da sala</label>
+        <input id="in-code" class="code-input" maxlength="5" placeholder="XXXXX" autocomplete="off">
       </div>
-      <button class="link-btn" id="btn-back2">← Voltar</button>
+      <div class="field">
+        <label for="in-name2">Seu nome</label>
+        <input id="in-name2" maxlength="18" placeholder="Seu nome" autocomplete="off">
+      </div>
+      <button class="btn btn-primary" id="btn-go2">Entrar na sala</button>
+      <p class="error-msg">${esc(state.error)}</p>
     </div>
   </div>`);
   const codeInput = wrap.querySelector("#in-code");
@@ -1225,111 +1369,75 @@ function renderJoin() {
 
 function renderLobby() {
   const players = state.players || [];
-  const canStart = players.length >= 4 && state.isHost;
-  const counts = computeRoleCounts(players.length);
-  const discussionSeconds = state.room?.discussionSeconds || 90;
-  const votingSeconds = state.room?.votingSeconds || 30;
+  const canStart = players.length >= 4 && state.isHost && !state.busy;
+  const discussionSeconds = state.room?.discussionSeconds || 60;
+  const votingSeconds = state.room?.votingSeconds || 45;
 
   const wrap = el(`<div class="wrap">
-    <div class="top-bar">
-      <span class="room-pill">Sala ${esc(state.roomCode || "")}</span>
-      <button class="link-btn" id="btn-leave">Sair</button>
+    ${chromeHeader(`Sala: ${esc(state.roomCode || "")}`)}
+    <div class="card">
+      <h3>Jogadores na sala (${players.length}/${MAX_PLAYERS})</h3>
+      <div class="player-list" id="lobby-players" style="margin-top:12px;"></div>
     </div>
-
-    <div class="card" style="text-align:center;">
-      <p class="room-code-label">código da sala</p>
-      <div class="room-code">${esc(state.roomCode || "")}</div>
-      <p class="tagline">Compartilhe esse código com os outros jogadores.</p>
-    </div>
-
-    <h3 style="margin:22px 0 12px;">Jogadores (${players.length})</h3>
-    <div class="player-list" id="lobby-players"></div>
-
-    ${
-      players.length < 4
-        ? `<p class="status-line"><span class="pulse"></span>São necessários pelo menos 4 jogadores para começar.</p>`
-        : `<p class="tagline">Com ${players.length} jogadores: 1 assassino, 1 detetive, 1 anjo e ${counts.cidadao} cidadão(s).</p>`
-    }
-
-    <div class="card lobby-settings" style="margin-top:18px;">
-      <h3>⚙ Configurações da sala</h3>
-      <p class="tagline">O anfitrião pode alterar os tempos enquanto a sala estiver no lobby.</p>
-
-      <div class="field">
+    <div class="card" style="margin-top:12px;">
+      <h3>Configurações da sala</h3>
+      <div class="field" style="margin-top:14px;">
         <label for="discussion-time">Tempo de discussão</label>
         <select id="discussion-time" ${state.isHost ? "" : "disabled"}>
           ${[30, 45, 60, 90, 120, 180]
             .map(
               (v) =>
-                `<option value="${v}" ${Number(discussionSeconds) === v ? "selected" : ""}>${formatSeconds(v)}</option>`,
+                `<option value="${v}" ${Number(discussionSeconds) === v ? "selected" : ""}>${v} segundos</option>`,
             )
             .join("")}
         </select>
       </div>
-
       <div class="field">
         <label for="voting-time">Tempo de votação</label>
         <select id="voting-time" ${state.isHost ? "" : "disabled"}>
           ${[15, 30, 45, 60, 90, 120]
             .map(
               (v) =>
-                `<option value="${v}" ${Number(votingSeconds) === v ? "selected" : ""}>${formatSeconds(v)}</option>`,
+                `<option value="${v}" ${Number(votingSeconds) === v ? "selected" : ""}>${v} segundos</option>`,
             )
             .join("")}
         </select>
       </div>
-
+      <p class="footnote" style="text-align:left;margin-top:0;">O anfitrião pode alterar a qualquer tempo.</p>
       ${
         state.isHost
-          ? `<p class="footnote">Você pode mudar essas opções a qualquer momento antes de iniciar — inclusive depois de uma partida terminar.</p>`
-          : `<p class="footnote">Somente o anfitrião pode alterar os tempos.</p>`
+          ? `<button class="btn btn-primary" id="btn-start" ${canStart ? "" : "disabled"}>${state.busy ? "Iniciando..." : "Iniciar jogo"}</button>`
+          : `<p class="waiting-block">Aguardando o anfitrião iniciar o jogo...</p>`
       }
+      <p class="footnote">É necessário no mínimo 4 jogadores.</p>
+      <p class="error-msg">${esc(state.error)}</p>
+      <button class="link-btn" id="btn-leave" style="width:100%;">Sair da sala</button>
     </div>
-
-    <hr class="divider">
-
-    ${
-      state.isHost
-        ? `<button class="btn btn-primary" id="btn-start" ${canStart ? "" : "disabled"}>Iniciar jogo</button>`
-        : `<p class="waiting-block"><span class="status-dot"></span>Aguardando o anfitrião iniciar o jogo...</p>`
-    }
   </div>`);
 
   const list = wrap.querySelector("#lobby-players");
-
-  players.forEach((p) => {
-    const chip = el(`<div class="player-chip">
-      <span class="dot"></span>
-      <span>${esc(p.name)}</span>
-    </div>`);
-
-    if (p.id === state.playerId) {
-      chip.appendChild(el(`<span class="you-tag">VOCÊ</span>`));
-    } else if (state.room && p.id === state.room.hostId) {
-      chip.appendChild(el(`<span class="host-tag">anfitrião</span>`));
-    }
-
-    list.appendChild(chip);
+  players.forEach((p, i) => {
+    const you = p.id === state.playerId ? " (você)" : "";
+    list.appendChild(
+      el(
+        `<div class="player-chip"><span class="num-badge">${i + 1}</span><span>${esc(p.name)}${you}</span><span class="dot"></span></div>`,
+      ),
+    );
   });
 
   wrap.querySelector("#btn-leave").onclick = leaveToLanding;
-
   const startBtn = wrap.querySelector("#btn-start");
   if (startBtn) startBtn.onclick = hostStartGame;
-
   const discussionSelect = wrap.querySelector("#discussion-time");
   const votingSelect = wrap.querySelector("#voting-time");
-
   if (state.isHost) {
     const saveSettings = async () => {
       if (state.busy) return;
       await updateRoomSettings(discussionSelect.value, votingSelect.value);
     };
-
     discussionSelect.onchange = saveSettings;
     votingSelect.onchange = saveSettings;
   }
-
   return wrap;
 }
 
