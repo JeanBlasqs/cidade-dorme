@@ -561,7 +561,6 @@ async function dbGetMyInvestigationItems(gameId, playerId) {
     .select("id,round")
     .eq("room_code", currentGame.room_code)
     .eq("round", 1)
-    .eq("status", "active")
     .order("id", { ascending: false })
     .limit(1);
   if (gamesError) {
