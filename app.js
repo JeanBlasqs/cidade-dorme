@@ -569,7 +569,7 @@ async function dbCreateInvestigationGame(code, round, players) {
   return game;
 }
 
-async function dbGetMyInvestigationItems(gameId, playerId) {
+async function dbGetMyInvestigationItems(gameId, playerId, playerRole) {
   if (!gameId || !playerId) {
     console.warn("dbGetMyInvestigationItems: gameId ou playerId ausente", {
       gameId,
@@ -593,17 +593,16 @@ async function dbGetMyInvestigationItems(gameId, playerId) {
     return [];
   }
 
-  const { data: me, error: meError } = await sb
-    .from("players")
-    .select("id,role")
-    .eq("room_code", currentGame.room_code)
-    .eq("id", playerId)
-    .maybeSingle();
+  // O jogador já foi carregado pelo refreshOnce().
+  // Não fazemos uma segunda consulta em players, pois o mesmo playerId pode
+  // aparecer em mais de um registro legado da sala e o maybeSingle() geraria
+  // PGRST116. O papel recebido aqui é o mesmo usado na tela.
+  const me = { id: playerId, role: playerRole };
 
-  if (meError || !me) {
-    console.error("dbGetMyInvestigationItems.player", {
-      error: meError,
+  if (!me.role) {
+    console.warn("dbGetMyInvestigationItems: papel do jogador ausente", {
       playerId,
+      gameId,
     });
     return [];
   }
@@ -1046,7 +1045,11 @@ async function refreshOnce() {
   if (meta.status === "active" && meta.investigationGameId) {
     const me = players.find((p) => p.id === state.playerId);
     state.investigationItems = me
-      ? await dbGetMyInvestigationItems(meta.investigationGameId, me.id)
+      ? await dbGetMyInvestigationItems(
+          meta.investigationGameId,
+          me.id,
+          me.role,
+        )
       : [];
     if (meta.phase === "gameover") {
       state.investigationCase = await dbGetInvestigationTruth(
