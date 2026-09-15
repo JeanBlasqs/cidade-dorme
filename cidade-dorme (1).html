@@ -1,0 +1,1021 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+<title>Cidade Dorme</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,700;1,9..144,500&family=Work+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --night-deep:#0f1330;
+    --night-mid:#1b2050;
+    --panel:#212752;
+    --panel-2:#262c5c;
+    --line:#3a4180;
+    --lantern:#e8a54b;
+    --lantern-soft:#f2c078;
+    --blood:#c04a4a;
+    --sage:#7fb08a;
+    --ink:#f2efe6;
+    --ink-dim:#a7addd;
+    --ink-faint:#6c74ab;
+    --radius:14px;
+    --serif:'Fraunces', serif;
+    --sans:'Work Sans', sans-serif;
+  }
+  *{ box-sizing:border-box; }
+  html,body{ height:100%; }
+  body{
+    margin:0;
+    font-family:var(--sans);
+    color:var(--ink);
+    background:
+      radial-gradient(ellipse at 20% -10%, rgba(232,165,75,0.08), transparent 40%),
+      linear-gradient(180deg, var(--night-deep) 0%, var(--night-mid) 100%);
+    min-height:100%;
+    -webkit-font-smoothing:antialiased;
+  }
+  #app{ min-height:100vh; display:flex; flex-direction:column; }
+
+  .stars{ position:fixed; inset:0; pointer-events:none; overflow:hidden; z-index:0; }
+  .star{ position:absolute; width:2px; height:2px; background:var(--ink); border-radius:50%; opacity:0.5; }
+  @media (prefers-reduced-motion: no-preference){
+    .star{ animation:twinkle 4s ease-in-out infinite; }
+  }
+  @keyframes twinkle{ 0%,100%{opacity:.15;} 50%{opacity:.7;} }
+
+  .wrap{ position:relative; z-index:1; flex:1; display:flex; flex-direction:column; max-width:520px; margin:0 auto; width:100%; padding:28px 20px 40px; }
+
+  h1,h2,h3{ font-family:var(--serif); font-weight:600; margin:0; letter-spacing:-0.01em; }
+  h1{ font-size:2.3rem; line-height:1.05; }
+  h2{ font-size:1.5rem; }
+  h3{ font-size:1.15rem; font-weight:600; }
+  p{ margin:0; }
+
+  .brand{ display:flex; align-items:center; gap:12px; margin-bottom:8px; }
+  .brand svg{ flex-shrink:0; }
+  .tagline{ color:var(--ink-dim); font-size:0.95rem; margin-top:6px; }
+
+  .center-stage{ flex:1; display:flex; flex-direction:column; justify-content:center; gap:28px; }
+
+  .card{
+    background:linear-gradient(180deg, var(--panel), var(--panel-2));
+    border:1px solid var(--line);
+    border-radius:var(--radius);
+    padding:22px;
+  }
+
+  .field{ display:flex; flex-direction:column; gap:6px; margin-bottom:16px; }
+  .field label{ font-size:0.85rem; color:var(--ink-dim); }
+  .field input{
+    background:var(--night-deep);
+    border:1px solid var(--line);
+    border-radius:10px;
+    padding:13px 14px;
+    color:var(--ink);
+    font-size:1.05rem;
+    font-family:var(--sans);
+  }
+  .field input:focus{ outline:2px solid var(--lantern); outline-offset:1px; border-color:var(--lantern); }
+  .field input.code-input{ text-transform:uppercase; letter-spacing:0.3em; font-family:var(--serif); font-size:1.3rem; text-align:center; }
+
+  button{ font-family:var(--sans); cursor:pointer; border:none; }
+  .btn{
+    width:100%;
+    padding:14px 18px;
+    border-radius:10px;
+    font-size:1rem;
+    font-weight:600;
+    transition:transform .12s ease, filter .12s ease;
+  }
+  .btn:active{ transform:scale(0.98); }
+  .btn:focus-visible{ outline:2px solid var(--ink); outline-offset:2px; }
+  .btn-primary{ background:var(--lantern); color:#221503; }
+  .btn-primary:hover{ filter:brightness(1.08); }
+  .btn-primary:disabled{ opacity:0.4; cursor:not-allowed; filter:none; }
+  .btn-ghost{ background:transparent; border:1px solid var(--line); color:var(--ink); }
+  .btn-ghost:hover{ border-color:var(--ink-dim); }
+  .btn-danger{ background:var(--blood); color:#fff; }
+  .btn-row{ display:flex; gap:10px; }
+  .btn-row .btn{ width:auto; flex:1; }
+  .link-btn{ background:none; color:var(--ink-dim); font-size:0.9rem; text-decoration:underline; padding:6px; }
+
+  .choice-row{ display:flex; gap:10px; margin-bottom:18px; }
+  .choice{ flex:1; padding:20px 14px; border-radius:var(--radius); border:1px solid var(--line); background:var(--panel); text-align:center; color:var(--ink); }
+  .choice:hover{ border-color:var(--lantern); }
+  .choice .glyph{ font-size:1.8rem; display:block; margin-bottom:8px; }
+  .choice .label{ font-weight:600; }
+
+  .error-msg{ color:var(--blood); font-size:0.9rem; margin-top:8px; min-height:1.2em; }
+
+  .room-code{ font-family:var(--serif); font-size:2.6rem; letter-spacing:0.22em; text-align:center; color:var(--lantern-soft); margin:6px 0 2px; }
+  .room-code-label{ text-align:center; color:var(--ink-faint); font-size:0.8rem; text-transform:none; }
+
+  .player-list{ display:flex; flex-direction:column; gap:8px; margin:18px 0; }
+  .player-chip{
+    display:flex; align-items:center; gap:10px;
+    background:var(--night-deep); border:1px solid var(--line); border-radius:10px;
+    padding:11px 14px; font-size:0.98rem;
+  }
+  .player-chip .dot{ width:8px; height:8px; border-radius:50%; background:var(--sage); flex-shrink:0; }
+  .player-chip.dead{ opacity:0.45; text-decoration:line-through; }
+  .player-chip.dead .dot{ background:var(--blood); }
+  .player-chip .you-tag{ margin-left:auto; font-size:0.75rem; color:var(--lantern); font-weight:600; }
+  .player-chip .host-tag{ margin-left:auto; font-size:0.75rem; color:var(--ink-faint); }
+
+  .target-grid{ display:flex; flex-direction:column; gap:8px; margin:16px 0; }
+  .target-btn{
+    text-align:left; background:var(--night-deep); border:1px solid var(--line); border-radius:10px;
+    padding:13px 14px; color:var(--ink); font-size:1rem; font-family:var(--sans);
+  }
+  .target-btn:hover{ border-color:var(--lantern); }
+  .target-btn.selected{ border-color:var(--lantern); background:rgba(232,165,75,0.12); }
+  .target-btn:disabled{ opacity:0.3; cursor:not-allowed; }
+
+  .phase-banner{
+    display:flex; align-items:center; gap:14px; padding:16px 18px; border-radius:var(--radius);
+    margin-bottom:20px; border:1px solid var(--line);
+  }
+  .phase-banner.night{ background:linear-gradient(120deg, rgba(27,32,80,0.9), rgba(15,19,48,0.9)); }
+  .phase-banner.day{ background:linear-gradient(120deg, rgba(232,165,75,0.16), rgba(242,192,120,0.06)); }
+  .phase-banner .phase-title{ font-family:var(--serif); font-size:1.3rem; }
+  .phase-banner .phase-sub{ color:var(--ink-dim); font-size:0.88rem; margin-top:2px; }
+
+  .role-reveal{ text-align:center; padding:26px 18px; }
+  .role-reveal .glyph{ font-size:3.4rem; display:block; margin-bottom:10px; }
+  .role-reveal .role-name{ font-family:var(--serif); font-size:1.7rem; color:var(--lantern-soft); }
+  .role-reveal .role-desc{ color:var(--ink-dim); margin-top:8px; font-size:0.95rem; line-height:1.5; }
+
+  .status-line{ display:flex; align-items:center; gap:8px; color:var(--ink-dim); font-size:0.9rem; margin:10px 0; }
+  .pulse{ width:7px; height:7px; border-radius:50%; background:var(--lantern); flex-shrink:0; }
+  @media (prefers-reduced-motion: no-preference){ .pulse{ animation:pulse 1.6s ease-in-out infinite; } }
+  @keyframes pulse{ 0%,100%{opacity:.3;} 50%{opacity:1;} }
+
+  .log-box{ background:var(--night-deep); border:1px solid var(--line); border-radius:10px; padding:14px; margin:16px 0; max-height:150px; overflow-y:auto; }
+  .log-box p{ font-size:0.88rem; color:var(--ink-dim); margin-bottom:6px; line-height:1.4; }
+  .log-box p:last-child{ margin-bottom:0; color:var(--ink); }
+
+  .divider{ height:1px; background:var(--line); margin:20px 0; border:none; }
+
+  .waiting-block{ text-align:center; padding:30px 10px; color:var(--ink-dim); }
+  .waiting-block .glyph{ font-size:2.4rem; display:block; margin-bottom:12px; }
+
+  .footnote{ text-align:center; color:var(--ink-faint); font-size:0.78rem; margin-top:26px; line-height:1.5; }
+
+  .top-bar{ display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; }
+  .top-bar .room-pill{ font-family:var(--serif); font-size:0.95rem; color:var(--ink-dim); letter-spacing:0.1em; }
+
+  .winner-banner{ text-align:center; padding:34px 20px; }
+  .winner-banner .glyph{ font-size:3.6rem; display:block; margin-bottom:10px; }
+  .winner-banner h1{ margin-bottom:8px; }
+
+  .vote-tally{ font-size:0.78rem; color:var(--ink-faint); margin-left:8px; }
+
+  @media (max-width:380px){
+    h1{ font-size:1.9rem; }
+    .room-code{ font-size:2.1rem; }
+  }
+</style>
+</head>
+<body>
+<div class="stars" id="stars"></div>
+<div id="app"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script>
+/* ============ Supabase ============ */
+const SUPABASE_URL = 'https://umozumbmjfjdmmppelwa.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVtb3p1bWJtamZqZG1tcHBlbHdhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk0MjA2MjAsImV4cCI6MjEwNDk5NjYyMH0.t01eyAh46XaeIP85ch-aSvjMmlGfEE92UiH2hSEM7K8';
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+function metaFromRow(row){
+  return {
+    hostId: row.host_id, status: row.status, phase: row.phase, round: row.round,
+    log: row.log || [], lastDeathName: row.last_death_name, lastEliminatedName: row.last_eliminated_name,
+    winner: row.winner, discussionSeconds: row.discussion_seconds
+  };
+}
+function rowFromMeta(code, meta){
+  return {
+    code, host_id: meta.hostId, status: meta.status, phase: meta.phase, round: meta.round,
+    log: meta.log, last_death_name: meta.lastDeathName, last_eliminated_name: meta.lastEliminatedName,
+    winner: meta.winner, discussion_seconds: meta.discussionSeconds
+  };
+}
+async function dbGetRoom(code){
+  const { data, error } = await sb.from('rooms').select('*').eq('code', code).maybeSingle();
+  if(error){ console.error('dbGetRoom', error); return null; }
+  return data ? metaFromRow(data) : null;
+}
+async function dbCreateRoom(code, meta){
+  const { error } = await sb.from('rooms').insert(rowFromMeta(code, meta));
+  if(error) console.error('dbCreateRoom', error);
+}
+async function dbUpdateRoom(code, meta){
+  const row = rowFromMeta(code, meta);
+  delete row.code;
+  const { error } = await sb.from('rooms').update(row).eq('code', code);
+  if(error) console.error('dbUpdateRoom', error);
+}
+async function dbUpsertPlayer(code, player){
+  const { error } = await sb.from('players').upsert({
+    room_code: code, id: player.id, name: player.name, alive: player.alive, role: player.role
+  }, { onConflict: 'room_code,id' });
+  if(error) console.error('dbUpsertPlayer', error);
+}
+async function dbFetchPlayers(code){
+  const { data, error } = await sb.from('players').select('*').eq('room_code', code).order('joined_at');
+  if(error){ console.error('dbFetchPlayers', error); return []; }
+  return data.map(r => ({ id:r.id, name:r.name, alive:r.alive, role:r.role, joinedAt: new Date(r.joined_at).getTime() }));
+}
+async function dbSubmitNightAction(code, round, role, playerId, targetId){
+  const { error } = await sb.from('night_actions').upsert({
+    room_code: code, round, role, player_id: playerId, target_id: targetId
+  }, { onConflict: 'room_code,round,role,player_id' });
+  if(error) console.error('dbSubmitNightAction', error);
+}
+async function dbGetNightActions(code, round, role){
+  const { data, error } = await sb.from('night_actions').select('target_id').eq('room_code', code).eq('round', round).eq('role', role);
+  if(error){ console.error('dbGetNightActions', error); return []; }
+  return data.map(r => r.target_id);
+}
+async function dbSubmitVote(code, round, voterId, targetId){
+  const { error } = await sb.from('votes').upsert({
+    room_code: code, round, voter_id: voterId, target_id: targetId
+  }, { onConflict: 'room_code,round,voter_id' });
+  if(error) console.error('dbSubmitVote', error);
+}
+async function dbGetVotes(code, round){
+  const { data, error } = await sb.from('votes').select('target_id').eq('room_code', code).eq('round', round);
+  if(error){ console.error('dbGetVotes', error); return []; }
+  return data.map(r => r.target_id);
+}
+
+/* ============ helpers: misc ============ */
+function genId(){
+  return 'p_' + Math.random().toString(36).slice(2,10) + Date.now().toString(36).slice(-4);
+}
+const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function genRoomCode(){
+  let out = '';
+  for(let i=0;i<5;i++) out += CODE_CHARS[Math.floor(Math.random()*CODE_CHARS.length)];
+  return out;
+}
+function shuffle(arr){
+  const a = arr.slice();
+  for(let i=a.length-1;i>0;i--){
+    const j = Math.floor(Math.random()*(i+1));
+    [a[i],a[j]] = [a[j],a[i]];
+  }
+  return a;
+}
+function computeRoleCounts(n){
+  const wolves = Math.max(1, Math.floor(n/4));
+  const seer = n>=4 ? 1 : 0;
+  const doctor = n>=5 ? 1 : 0;
+  const villagers = Math.max(0, n - wolves - seer - doctor);
+  return { wolf:wolves, seer, doctor, villager:villagers };
+}
+const ROLE_INFO = {
+  wolf:      { glyph:'🐺', name:'Lobisomem', desc:'Toda noite, você e os outros lobos escolhem uma vítima para eliminar. De dia, finja ser inocente.' },
+  seer:      { glyph:'🔮', name:'Vidente', desc:'Toda noite, você pode investigar uma pessoa e descobrir se ela é um lobisomem.' },
+  doctor:    { glyph:'🩹', name:'Médico', desc:'Toda noite, você escolhe alguém para proteger. Se essa pessoa for atacada, ela sobrevive.' },
+  villager:  { glyph:'🌾', name:'Aldeão', desc:'Você não tem poderes especiais. Use a conversa e o voto para descobrir quem são os lobos.' }
+};
+
+/* ============ app state ============ */
+const state = {
+  screen:'landing',        // landing | create | join | lobby | game
+  playerId: genId(),
+  playerName:'',
+  roomCode:null,
+  isHost:false,
+  room:null,               // meta object
+  players:[],              // array of player objects
+  error:'',
+  busy:false,
+  selectedTarget:null,
+  pollHandle:null,
+  lastPhaseSeen:null,
+  discussionEndsAt:null
+};
+
+/* ============ room meta shape ============
+{
+  hostId, status:'lobby'|'active', phase:'night'|'day_reveal'|'day_discussion'|'day_voting'|'day_results'|'gameover',
+  round, log:[strings], lastDeathName, lastEliminatedName, winner: 'village'|'wolves'|null,
+  discussionSeconds
+}
+*/
+
+/* ============ core actions ============ */
+async function createRoom(name){
+  let code = genRoomCode();
+  const meta = {
+    hostId: state.playerId, status:'lobby', phase:null, round:0,
+    log:[], lastDeathName:null, lastEliminatedName:null, winner:null, discussionSeconds:75
+  };
+  await dbCreateRoom(code, meta);
+  await dbUpsertPlayer(code, { id: state.playerId, name, alive:true, role:null });
+  state.roomCode = code;
+  state.isHost = true;
+  state.playerName = name;
+  enterLobby();
+}
+
+async function joinRoom(code, name){
+  code = code.trim().toUpperCase();
+  const meta = await dbGetRoom(code);
+  if(!meta){ state.error = 'Sala não encontrada. Confira o código.'; render(); return; }
+  if(meta.status !== 'lobby'){ state.error = 'Esse jogo já começou. Peça um novo código.'; render(); return; }
+  await dbUpsertPlayer(code, { id: state.playerId, name, alive:true, role:null });
+  state.roomCode = code;
+  state.isHost = (meta.hostId === state.playerId);
+  state.playerName = name;
+  state.error = '';
+  enterLobby();
+}
+
+function enterLobby(){
+  state.screen = 'lobby';
+  state.error='';
+  render();
+  startPolling();
+}
+
+async function fetchPlayers(code){
+  return await dbFetchPlayers(code);
+}
+
+async function refresh(){
+  if(!state.roomCode) return;
+  const meta = await dbGetRoom(state.roomCode);
+  if(!meta) return;
+  const players = await fetchPlayers(state.roomCode);
+  state.room = meta;
+  state.players = players;
+  if(meta.status === 'active' && state.screen !== 'game'){
+    state.screen = 'game';
+    state.selectedTarget = null;
+  }
+  if(meta.phase !== state.lastPhaseSeen){
+    state.selectedTarget = null;
+    if(meta.phase === 'day_discussion'){
+      state.discussionEndsAt = Date.now() + (meta.discussionSeconds||75)*1000;
+    }
+    state.lastPhaseSeen = meta.phase;
+  }
+  render();
+}
+
+function startPolling(){
+  stopPolling();
+  refresh();
+  subscribeRealtime(state.roomCode);
+  state.pollHandle = setInterval(refresh, 4000); // reforço, caso o realtime perca algum evento
+}
+function stopPolling(){
+  if(state.pollHandle){ clearInterval(state.pollHandle); state.pollHandle=null; }
+  if(state.channel){ sb.removeChannel(state.channel); state.channel=null; }
+}
+function subscribeRealtime(code){
+  state.channel = sb.channel('room-'+code)
+    .on('postgres_changes', { event:'*', schema:'public', table:'rooms', filter:`code=eq.${code}` }, refresh)
+    .on('postgres_changes', { event:'*', schema:'public', table:'players', filter:`room_code=eq.${code}` }, refresh)
+    .on('postgres_changes', { event:'*', schema:'public', table:'night_actions', filter:`room_code=eq.${code}` }, refresh)
+    .on('postgres_changes', { event:'*', schema:'public', table:'votes', filter:`room_code=eq.${code}` }, refresh)
+    .subscribe();
+}
+
+/* ---- host: start game ---- */
+async function hostStartGame(){
+  if(state.busy) return;
+  state.busy = true; render();
+  const players = await fetchPlayers(state.roomCode);
+  const counts = computeRoleCounts(players.length);
+  let pool = [];
+  for(let i=0;i<counts.wolf;i++) pool.push('wolf');
+  for(let i=0;i<counts.seer;i++) pool.push('seer');
+  for(let i=0;i<counts.doctor;i++) pool.push('doctor');
+  for(let i=0;i<counts.villager;i++) pool.push('villager');
+  pool = shuffle(pool);
+  const shuffledPlayers = shuffle(players);
+  await Promise.all(shuffledPlayers.map((p, idx) =>
+    dbUpsertPlayer(state.roomCode, { ...p, role: pool[idx] || 'villager', alive:true })
+  ));
+  const meta = await dbGetRoom(state.roomCode);
+  meta.status = 'active';
+  meta.phase = 'night';
+  meta.round = 1;
+  meta.log = [`A cidade adormece pela primeira vez... (Rodada 1)`];
+  meta.winner = null;
+  await dbUpdateRoom(state.roomCode, meta);
+  state.busy = false;
+  refresh();
+}
+
+/* ---- night actions ---- */
+async function submitWolfVote(targetId){
+  await dbSubmitNightAction(state.roomCode, state.room.round, 'wolf', state.playerId, targetId);
+  state.selectedTarget = targetId;
+  render();
+}
+async function submitDoctorPick(targetId){
+  await dbSubmitNightAction(state.roomCode, state.room.round, 'doctor', state.playerId, targetId);
+  state.selectedTarget = targetId;
+  render();
+}
+async function submitSeerPick(targetId){
+  await dbSubmitNightAction(state.roomCode, state.room.round, 'seer', state.playerId, targetId);
+  state.selectedTarget = targetId;
+  render();
+}
+
+function tally(counts){
+  let best=null, bestN=-1, tie=false;
+  Object.entries(counts).forEach(([k,v])=>{
+    if(v>bestN){ best=k; bestN=v; tie=false; }
+    else if(v===bestN){ tie=true; }
+  });
+  return { winner: tie? null : best, tie };
+}
+
+async function hostResolveNight(){
+  if(state.busy) return;
+  state.busy = true; render();
+  const round = state.room.round;
+  const players = await fetchPlayers(state.roomCode);
+  const aliveWolves = players.filter(p=>p.alive && p.role==='wolf');
+  const wolfVotes = await dbGetNightActions(state.roomCode, round, 'wolf');
+  const counts = {};
+  wolfVotes.forEach(v=>{ if(v) counts[v] = (counts[v]||0)+1; });
+  let victimId = null;
+  if(Object.keys(counts).length){
+    const t = tally(counts);
+    const candidates = t.winner ? [t.winner] : Object.keys(counts);
+    victimId = candidates[Math.floor(Math.random()*candidates.length)];
+  } else if(aliveWolves.length){
+    const targets = players.filter(p=>p.alive && p.role!=='wolf');
+    if(targets.length) victimId = targets[Math.floor(Math.random()*targets.length)].id;
+  }
+  const doctorPicks = await dbGetNightActions(state.roomCode, round, 'doctor');
+  const doctorPick = doctorPicks[0] || null;
+  let deathName = null;
+  if(victimId && victimId !== doctorPick){
+    const victim = players.find(p=>p.id===victimId);
+    if(victim){
+      await dbUpsertPlayer(state.roomCode, { ...victim, alive:false });
+      deathName = victim.name;
+    }
+  }
+  const updatedPlayers = await fetchPlayers(state.roomCode);
+  const meta = await dbGetRoom(state.roomCode);
+  meta.lastDeathName = deathName;
+  meta.log.push(deathName ? `🌅 Ao amanhecer, ${deathName} foi encontrado(a) sem vida.` : `🌅 A cidade acorda e, surpreendentemente, ninguém morreu esta noite.`);
+  const win = checkWinner(updatedPlayers);
+  if(win){
+    meta.phase = 'gameover';
+    meta.winner = win;
+    meta.log.push(win==='village' ? '🌾 Os aldeões descobriram e eliminaram todos os lobos!' : '🐺 Os lobisomens dominaram a cidade!');
+  } else {
+    meta.phase = 'day_reveal';
+  }
+  await dbUpdateRoom(state.roomCode, meta);
+  state.busy = false;
+  refresh();
+}
+
+function checkWinner(players){
+  const alive = players.filter(p=>p.alive);
+  const wolves = alive.filter(p=>p.role==='wolf').length;
+  const others = alive.length - wolves;
+  if(wolves === 0) return 'village';
+  if(wolves >= others) return 'wolves';
+  return null;
+}
+
+async function hostGoToDiscussion(){
+  const meta = await dbGetRoom(state.roomCode);
+  meta.phase = 'day_discussion';
+  await dbUpdateRoom(state.roomCode, meta);
+  refresh();
+}
+async function hostGoToVoting(){
+  const meta = await dbGetRoom(state.roomCode);
+  meta.phase = 'day_voting';
+  await dbUpdateRoom(state.roomCode, meta);
+  refresh();
+}
+async function submitVote(targetId){
+  await dbSubmitVote(state.roomCode, state.room.round, state.playerId, targetId);
+  state.selectedTarget = targetId;
+  render();
+}
+async function hostResolveVotes(){
+  if(state.busy) return;
+  state.busy = true; render();
+  const round = state.room.round;
+  const players = await fetchPlayers(state.roomCode);
+  const votes = await dbGetVotes(state.roomCode, round);
+  const counts = {};
+  votes.forEach(v=>{ if(v && v!=='abstain') counts[v]=(counts[v]||0)+1; });
+  let eliminatedName = null;
+  if(Object.keys(counts).length){
+    const t = tally(counts);
+    if(t.winner){
+      const p = players.find(pl=>pl.id===t.winner);
+      if(p){
+        await dbUpsertPlayer(state.roomCode, { ...p, alive:false });
+        eliminatedName = p.name;
+      }
+    }
+  }
+  const updatedPlayers = await fetchPlayers(state.roomCode);
+  const meta = await dbGetRoom(state.roomCode);
+  meta.lastEliminatedName = eliminatedName;
+  meta.log.push(eliminatedName ? `🗳️ A cidade votou e eliminou ${eliminatedName}.` : `🗳️ Os votos empataram — ninguém foi eliminado.`);
+  const win = checkWinner(updatedPlayers);
+  if(win){
+    meta.phase = 'gameover';
+    meta.winner = win;
+    meta.log.push(win==='village' ? '🌾 Os aldeões descobriram e eliminaram todos os lobos!' : '🐺 Os lobisomens dominaram a cidade!');
+  } else {
+    meta.phase = 'day_results';
+  }
+  await dbUpdateRoom(state.roomCode, meta);
+  state.busy = false;
+  refresh();
+}
+async function hostNextNight(){
+  const meta = await dbGetRoom(state.roomCode);
+  meta.round += 1;
+  meta.phase = 'night';
+  meta.log.push(`🌙 A cidade dorme novamente... (Rodada ${meta.round})`);
+  await dbUpdateRoom(state.roomCode, meta);
+  refresh();
+}
+
+function leaveToLanding(){
+  stopPolling();
+  Object.assign(state, {
+    screen:'landing', roomCode:null, isHost:false, room:null, players:[],
+    error:'', busy:false, selectedTarget:null, lastPhaseSeen:null
+  });
+  render();
+}
+
+/* ============ rendering ============ */
+function el(html){ const t=document.createElement('template'); t.innerHTML=html.trim(); return t.content.firstElementChild; }
+function esc(s){ const d=document.createElement('div'); d.textContent = s==null?'':String(s); return d.innerHTML; }
+
+function moonSvg(size=44){
+  return `<svg width="${size}" height="${size}" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M30 6C20 8 13 17 13 27c0 11 9 20 20 20 5 0 9.5-1.8 13-4.8C40.5 45 33.7 48 26 48 12.7 48 2 37.3 2 24S12.7 0 26 0c1.4 0 2.7.1 4 .3-1.4 1.7-2 3.7 0 5.7z" fill="#f2c078" transform="translate(4,0) scale(0.85)"/>
+  </svg>`;
+}
+function sunSvg(size=44){
+  return `<svg width="${size}" height="${size}" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="24" cy="24" r="11" fill="#e8a54b"/>
+    <g stroke="#e8a54b" stroke-width="3" stroke-linecap="round">
+      <line x1="24" y1="2" x2="24" y2="8"/><line x1="24" y1="40" x2="24" y2="46"/>
+      <line x1="2" y1="24" x2="8" y2="24"/><line x1="40" y1="24" x2="46" y2="24"/>
+      <line x1="8" y1="8" x2="12.5" y2="12.5"/><line x1="35.5" y1="35.5" x2="40" y2="40"/>
+      <line x1="40" y1="8" x2="35.5" y2="12.5"/><line x1="12.5" y1="35.5" x2="8" y2="40"/>
+    </g>
+  </svg>`;
+}
+
+function renderStars(){
+  const c = document.getElementById('stars');
+  if(c.childElementCount) return;
+  for(let i=0;i<40;i++){
+    const s = document.createElement('div');
+    s.className='star';
+    s.style.left = Math.random()*100+'%';
+    s.style.top = Math.random()*70+'%';
+    s.style.animationDelay = (Math.random()*4)+'s';
+    c.appendChild(s);
+  }
+}
+
+function render(){
+  renderStars();
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+  let node;
+  if(state.screen==='landing') node = renderLanding();
+  else if(state.screen==='create') node = renderCreate();
+  else if(state.screen==='join') node = renderJoin();
+  else if(state.screen==='lobby') node = renderLobby();
+  else if(state.screen==='game') node = renderGame();
+  app.appendChild(node);
+}
+
+function renderLanding(){
+  const wrap = el(`<div class="wrap">
+    <div class="center-stage">
+      <div>
+        <div class="brand">${moonSvg(40)}<h1>Cidade Dorme</h1></div>
+        <p class="tagline">Um jogo de dedução social. Descubra os lobisomens antes que seja tarde — ou disfarce-se entre os aldeões.</p>
+      </div>
+      <div class="card">
+        <div class="choice-row">
+          <button class="choice" id="btn-create"><span class="glyph">🏮</span><span class="label">Criar sala</span></button>
+          <button class="choice" id="btn-join"><span class="glyph">🚪</span><span class="label">Entrar em sala</span></button>
+        </div>
+        <p class="footnote" style="margin-top:0;">Jogue com 4 ou mais pessoas, cada uma no seu próprio celular.</p>
+      </div>
+    </div>
+    <p class="footnote">Papéis: Lobisomem 🐺 · Aldeão 🌾 · Vidente 🔮 · Médico 🩹</p>
+  </div>`);
+  wrap.querySelector('#btn-create').onclick = ()=>{ state.screen='create'; state.error=''; render(); };
+  wrap.querySelector('#btn-join').onclick = ()=>{ state.screen='join'; state.error=''; render(); };
+  return wrap;
+}
+
+function renderCreate(){
+  const wrap = el(`<div class="wrap">
+    <div class="center-stage">
+      <div class="brand">${moonSvg(34)}<h2>Criar uma sala</h2></div>
+      <div class="card">
+        <div class="field">
+          <label for="in-name">Seu nome</label>
+          <input id="in-name" maxlength="18" placeholder="Como quer ser chamado(a)?" autocomplete="off">
+        </div>
+        <button class="btn btn-primary" id="btn-go">Criar sala</button>
+        <p class="error-msg">${esc(state.error)}</p>
+      </div>
+      <button class="link-btn" id="btn-back">← Voltar</button>
+    </div>
+  </div>`);
+  const input = wrap.querySelector('#in-name');
+  wrap.querySelector('#btn-go').onclick = async ()=>{
+    const name = input.value.trim();
+    if(!name){ state.error='Digite um nome.'; render(); return; }
+    state.error='';
+    await createRoom(name);
+  };
+  input.addEventListener('keydown', e=>{ if(e.key==='Enter') wrap.querySelector('#btn-go').click(); });
+  wrap.querySelector('#btn-back').onclick = ()=>{ state.screen='landing'; render(); };
+  return wrap;
+}
+
+function renderJoin(){
+  const wrap = el(`<div class="wrap">
+    <div class="center-stage">
+      <div class="brand">${moonSvg(34)}<h2>Entrar em uma sala</h2></div>
+      <div class="card">
+        <div class="field">
+          <label for="in-code">Código da sala</label>
+          <input id="in-code" class="code-input" maxlength="5" placeholder="XXXXX" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="in-name2">Seu nome</label>
+          <input id="in-name2" maxlength="18" placeholder="Como quer ser chamado(a)?" autocomplete="off">
+        </div>
+        <button class="btn btn-primary" id="btn-go2">Entrar</button>
+        <p class="error-msg">${esc(state.error)}</p>
+      </div>
+      <button class="link-btn" id="btn-back2">← Voltar</button>
+    </div>
+  </div>`);
+  const codeInput = wrap.querySelector('#in-code');
+  const nameInput = wrap.querySelector('#in-name2');
+  wrap.querySelector('#btn-go2').onclick = async ()=>{
+    const code = codeInput.value.trim();
+    const name = nameInput.value.trim();
+    if(!code || !name){ state.error='Preencha o código e o nome.'; render(); return; }
+    await joinRoom(code, name);
+  };
+  nameInput.addEventListener('keydown', e=>{ if(e.key==='Enter') wrap.querySelector('#btn-go2').click(); });
+  wrap.querySelector('#btn-back2').onclick = ()=>{ state.screen='landing'; render(); };
+  return wrap;
+}
+
+function renderLobby(){
+  const players = state.players || [];
+  const canStart = players.length>=4 && state.isHost;
+  const counts = computeRoleCounts(players.length);
+  const wrap = el(`<div class="wrap">
+    <div class="top-bar">
+      <span class="room-pill">Sala ${esc(state.roomCode||'')}</span>
+      <button class="link-btn" id="btn-leave">Sair</button>
+    </div>
+    <div class="card" style="text-align:center;">
+      <p class="room-code-label">código da sala</p>
+      <div class="room-code">${esc(state.roomCode||'')}</div>
+      <p class="tagline">Compartilhe esse código com os outros jogadores.</p>
+    </div>
+    <h3 style="margin:22px 0 12px;">Jogadores (${players.length})</h3>
+    <div class="player-list" id="lobby-players"></div>
+    ${players.length < 4 ? `<p class="status-line"><span class="pulse"></span>São necessários pelo menos 4 jogadores para começar.</p>` : ''}
+    ${players.length>=4 ? `<p class="tagline">Com ${players.length} jogadores: ${counts.wolf} lobo(s)${counts.seer?', 1 vidente':''}${counts.doctor?', 1 médico':''}, ${counts.villager} aldeão(ões).</p>` : ''}
+    <hr class="divider">
+    ${state.isHost
+      ? `<button class="btn btn-primary" id="btn-start" ${canStart?'':'disabled'}>Iniciar jogo</button>`
+      : `<p class="waiting-block"><span class="glyph">🕯️</span>Aguardando o anfitrião iniciar o jogo...</p>`
+    }
+  </div>`);
+  const list = wrap.querySelector('#lobby-players');
+  players.forEach(p=>{
+    const chip = el(`<div class="player-chip"><span class="dot"></span><span>${esc(p.name)}</span></div>`);
+    if(p.id === state.playerId) chip.appendChild(el(`<span class="you-tag">VOCÊ</span>`));
+    else if(state.room && p.id === state.room.hostId) chip.appendChild(el(`<span class="host-tag">anfitrião</span>`));
+    list.appendChild(chip);
+  });
+  wrap.querySelector('#btn-leave').onclick = leaveToLanding;
+  const startBtn = wrap.querySelector('#btn-start');
+  if(startBtn) startBtn.onclick = hostStartGame;
+  return wrap;
+}
+
+function myPlayer(){
+  return (state.players||[]).find(p=>p.id===state.playerId) || null;
+}
+
+function renderGame(){
+  const meta = state.room;
+  if(!meta) return el(`<div class="wrap"><p>Carregando...</p></div>`);
+  if(meta.phase === 'gameover') return renderGameOver();
+  const me = myPlayer();
+  if(!me) return el(`<div class="wrap"><p>Carregando jogador...</p></div>`);
+
+  const wrap = el(`<div class="wrap"></div>`);
+  wrap.appendChild(el(`<div class="top-bar">
+    <span class="room-pill">Sala ${esc(state.roomCode)} · Rodada ${meta.round}</span>
+    <button class="link-btn" id="btn-leave">Sair</button>
+  </div>`));
+  wrap.querySelector('#btn-leave').onclick = leaveToLanding;
+
+  const isNight = meta.phase === 'night';
+  const banner = el(`<div class="phase-banner ${isNight?'night':'day'}">
+    ${isNight ? moonSvg(38) : sunSvg(38)}
+    <div>
+      <div class="phase-title">${phaseTitle(meta.phase)}</div>
+      <div class="phase-sub">${phaseSubtitle(meta, me)}</div>
+    </div>
+  </div>`);
+  wrap.appendChild(banner);
+
+  if(!me.alive){
+    wrap.appendChild(renderSpectator(meta, me));
+  } else if(meta.phase === 'night'){
+    wrap.appendChild(renderNightPanel(meta, me));
+  } else if(meta.phase === 'day_reveal'){
+    wrap.appendChild(renderDayReveal(meta, me));
+  } else if(meta.phase === 'day_discussion'){
+    wrap.appendChild(renderDiscussion(meta, me));
+  } else if(meta.phase === 'day_voting'){
+    wrap.appendChild(renderVoting(meta, me));
+  } else if(meta.phase === 'day_results'){
+    wrap.appendChild(renderDayResults(meta, me));
+  }
+
+  wrap.appendChild(renderRosterCollapsed());
+  wrap.appendChild(renderLog(meta));
+  return wrap;
+}
+
+function phaseTitle(phase){
+  return {
+    night:'A cidade dorme', day_reveal:'O sol nasce', day_discussion:'Discussão',
+    day_voting:'Hora de votar', day_results:'Resultado da votação'
+  }[phase] || '';
+}
+function phaseSubtitle(meta, me){
+  if(meta.phase==='night') return me.alive ? 'Aja em silêncio, se seu papel permitir.' : 'Você está observando desta rodada.';
+  if(meta.phase==='day_reveal') return 'Veja o que aconteceu durante a noite.';
+  if(meta.phase==='day_discussion') return 'Conversem e tentem descobrir quem são os lobos.';
+  if(meta.phase==='day_voting') return 'Escolha em quem votar para eliminar.';
+  if(meta.phase==='day_results') return 'Veja quem a cidade decidiu eliminar.';
+  return '';
+}
+
+function renderSpectator(meta, me){
+  return el(`<div class="card">
+    <div class="waiting-block">
+      <span class="glyph">👻</span>
+      <p>Você foi eliminado(a). Seu papel era <strong style="color:var(--ink)">${ROLE_INFO[me.role].name}</strong>.</p>
+      <p style="margin-top:8px;">Continue acompanhando em silêncio até o fim da partida.</p>
+    </div>
+  </div>`);
+}
+
+function aliveOthers(exceptId){
+  return (state.players||[]).filter(p=>p.alive && p.id!==exceptId);
+}
+
+function renderNightPanel(meta, me){
+  const card = el(`<div class="card"></div>`);
+  const round = meta.round;
+
+  if(me.role === 'villager'){
+    card.appendChild(el(`<div class="waiting-block"><span class="glyph">😴</span><p>Você não tem ação noturna. Durma tranquilo(a)... por enquanto.</p></div>`));
+  }
+  if(me.role === 'wolf'){
+    const teammates = (state.players||[]).filter(p=>p.role==='wolf' && p.id!==me.id && p.alive);
+    const targets = aliveOthers(me.id).filter(p=>p.role!=='wolf');
+    const box = el(`<div>
+      <h3>🐺 Escolha uma vítima</h3>
+      ${teammates.length ? `<p class="tagline" style="margin:6px 0 14px;">Seus companheiros lobos: ${teammates.map(t=>esc(t.name)).join(', ')}</p>` : `<p class="tagline" style="margin:6px 0 14px;">Você é o único lobo restante.</p>`}
+      <div class="target-grid" id="wolf-targets"></div>
+    </div>`);
+    const grid = box.querySelector('#wolf-targets');
+    targets.forEach(t=>{
+      const b = el(`<button class="target-btn">${esc(t.name)}</button>`);
+      if(state.selectedTarget===t.id) b.classList.add('selected');
+      b.onclick = ()=>submitWolfVote(t.id);
+      grid.appendChild(b);
+    });
+    card.appendChild(box);
+  }
+  if(me.role === 'doctor'){
+    const targets = aliveOthers(null).concat(me.alive? [me]:[]).filter((p,i,arr)=>arr.findIndex(x=>x.id===p.id)===i);
+    const box = el(`<div>
+      <h3>🩹 Escolha quem proteger</h3>
+      <div class="target-grid" id="doc-targets"></div>
+    </div>`);
+    const grid = box.querySelector('#doc-targets');
+    (state.players||[]).filter(p=>p.alive).forEach(t=>{
+      const b = el(`<button class="target-btn">${esc(t.name)}${t.id===me.id?' (você)':''}</button>`);
+      if(state.selectedTarget===t.id) b.classList.add('selected');
+      b.onclick = ()=>submitDoctorPick(t.id);
+      grid.appendChild(b);
+    });
+    card.appendChild(box);
+  }
+  if(me.role === 'seer'){
+    const targets = aliveOthers(me.id);
+    const box = el(`<div>
+      <h3>🔮 Investigar alguém</h3>
+      <div class="target-grid" id="seer-targets"></div>
+      <p id="seer-result" class="status-line" style="margin-top:14px;"></p>
+    </div>`);
+    const grid = box.querySelector('#seer-targets');
+    targets.forEach(t=>{
+      const b = el(`<button class="target-btn">${esc(t.name)}</button>`);
+      if(state.selectedTarget===t.id) b.classList.add('selected');
+      b.onclick = async ()=>{
+        await submitSeerPick(t.id);
+        const resultEl = box.querySelector('#seer-result');
+        const isWolf = t.role === 'wolf';
+        resultEl.innerHTML = `<span style="color:${isWolf?'var(--blood)':'var(--sage)'}">● </span> ${esc(t.name)} ${isWolf? 'é um lobisomem!' : 'não é um lobisomem.'}`;
+      };
+      grid.appendChild(b);
+    });
+    if(state.selectedTarget){
+      const chosen = targets.find(t=>t.id===state.selectedTarget);
+      if(chosen){
+        const isWolf = chosen.role==='wolf';
+        box.querySelector('#seer-result').innerHTML = `<span style="color:${isWolf?'var(--blood)':'var(--sage)'}">● </span> ${esc(chosen.name)} ${isWolf? 'é um lobisomem!' : 'não é um lobisomem.'}`;
+      }
+    }
+    card.appendChild(box);
+  }
+
+  if(state.isHost){
+    card.appendChild(el(`<hr class="divider">`));
+    const btn = el(`<button class="btn btn-ghost" id="btn-resolve-night">Resolver a noite (anfitrião)</button>`);
+    btn.onclick = hostResolveNight;
+    card.appendChild(btn);
+    card.appendChild(el(`<p class="footnote">Use quando todos os papéis noturnos já tiverem agido.</p>`));
+  }
+  return card;
+}
+
+function renderDayReveal(meta, me){
+  const card = el(`<div class="card">
+    <div class="role-reveal">
+      <span class="glyph">${meta.lastDeathName ? '💀' : '🌤️'}</span>
+      <p style="font-size:1.1rem;">${meta.lastDeathName ? `<strong>${esc(meta.lastDeathName)}</strong> não sobreviveu à noite.` : 'Ninguém morreu esta noite.'}</p>
+    </div>
+    ${state.isHost ? `<button class="btn btn-primary" id="btn-to-discussion">Ir para a discussão</button>` : `<p class="waiting-block"><span class="glyph">🕯️</span>Aguardando o anfitrião continuar...</p>`}
+  </div>`);
+  const btn = card.querySelector('#btn-to-discussion');
+  if(btn) btn.onclick = hostGoToDiscussion;
+  return card;
+}
+
+function renderDiscussion(meta, me){
+  const card = el(`<div class="card">
+    <div style="text-align:center; padding:10px 0 4px;">
+      <p class="tagline">Conversem em voz alta sobre quem parece suspeito.</p>
+      <h2 id="timer-display" style="margin-top:14px; color:var(--lantern-soft);">--:--</h2>
+    </div>
+    ${state.isHost ? `<button class="btn btn-primary" id="btn-to-voting">Ir para a votação</button>` : ''}
+  </div>`);
+  const disp = card.querySelector('#timer-display');
+  function tick(){
+    const remain = Math.max(0, Math.round((state.discussionEndsAt - Date.now())/1000));
+    const m = String(Math.floor(remain/60)).padStart(2,'0');
+    const s = String(remain%60).padStart(2,'0');
+    disp.textContent = `${m}:${s}`;
+    if(remain<=0) clearInterval(iv);
+  }
+  const iv = setInterval(tick, 500);
+  tick();
+  const btn = card.querySelector('#btn-to-voting');
+  if(btn) btn.onclick = ()=>{ clearInterval(iv); hostGoToVoting(); };
+  return card;
+}
+
+function renderVoting(meta, me){
+  const alivePlayers = (state.players||[]).filter(p=>p.alive);
+  const box = el(`<div class="card">
+    <h3>🗳️ Em quem você vota?</h3>
+    <div class="target-grid" id="vote-targets" style="margin-top:14px;"></div>
+    <button class="target-btn" id="vote-abstain" style="margin-top:4px;">Abster-se</button>
+  </div>`);
+  const grid = box.querySelector('#vote-targets');
+  alivePlayers.filter(p=>p.id!==me.id).forEach(t=>{
+    const b = el(`<button class="target-btn">${esc(t.name)}</button>`);
+    if(state.selectedTarget===t.id) b.classList.add('selected');
+    b.onclick = ()=>submitVote(t.id);
+    grid.appendChild(b);
+  });
+  const abstainBtn = box.querySelector('#vote-abstain');
+  if(state.selectedTarget==='abstain') abstainBtn.classList.add('selected');
+  abstainBtn.onclick = ()=>submitVote('abstain');
+
+  if(state.isHost){
+    box.appendChild(el(`<hr class="divider">`));
+    const btn = el(`<button class="btn btn-ghost" id="btn-resolve-votes">Apurar votos (anfitrião)</button>`);
+    btn.onclick = hostResolveVotes;
+    box.appendChild(btn);
+  }
+  return box;
+}
+
+function renderDayResults(meta, me){
+  const card = el(`<div class="card">
+    <div class="role-reveal">
+      <span class="glyph">${meta.lastEliminatedName ? '⚖️' : '🤝'}</span>
+      <p style="font-size:1.1rem;">${meta.lastEliminatedName ? `<strong>${esc(meta.lastEliminatedName)}</strong> foi eliminado(a) pela cidade.` : 'A votação empatou — ninguém foi eliminado.'}</p>
+    </div>
+    ${state.isHost ? `<button class="btn btn-primary" id="btn-next-night">Próxima noite</button>` : `<p class="waiting-block"><span class="glyph">🕯️</span>Aguardando o anfitrião continuar...</p>`}
+  </div>`);
+  const btn = card.querySelector('#btn-next-night');
+  if(btn) btn.onclick = hostNextNight;
+  return card;
+}
+
+function renderGameOver(){
+  const meta = state.room;
+  const villageWon = meta.winner === 'village';
+  const wrap = el(`<div class="wrap">
+    <div class="center-stage">
+      <div class="card winner-banner">
+        <span class="glyph">${villageWon?'🌾':'🐺'}</span>
+        <h1>${villageWon? 'A cidade venceu!' : 'Os lobos venceram!'}</h1>
+        <p class="tagline">${villageWon? 'Todos os lobisomens foram eliminados.' : 'Os lobisomens dominaram a cidade.'}</p>
+      </div>
+      <div class="card">
+        <h3 style="margin-bottom:12px;">Todos os papéis</h3>
+        <div class="player-list" id="final-roles"></div>
+      </div>
+      <button class="btn btn-ghost" id="btn-newgame">Voltar ao início</button>
+    </div>
+  </div>`);
+  const list = wrap.querySelector('#final-roles');
+  (state.players||[]).forEach(p=>{
+    const info = ROLE_INFO[p.role] || ROLE_INFO.villager;
+    const chip = el(`<div class="player-chip ${p.alive?'':'dead'}"><span class="dot"></span><span>${esc(p.name)} — ${info.glyph} ${info.name}</span></div>`);
+    list.appendChild(chip);
+  });
+  wrap.querySelector('#btn-newgame').onclick = leaveToLanding;
+  return wrap;
+}
+
+function renderRosterCollapsed(){
+  const me = myPlayer();
+  const details = el(`<details class="card" style="margin-top:18px;">
+    <summary style="cursor:pointer; font-family:var(--serif); font-size:1.05rem;">Jogadores (${(state.players||[]).length})</summary>
+    <div class="player-list" style="margin-top:14px;" id="roster-list"></div>
+  </details>`);
+  const list = details.querySelector('#roster-list');
+  (state.players||[]).forEach(p=>{
+    const chip = el(`<div class="player-chip ${p.alive?'':'dead'}"><span class="dot"></span><span>${esc(p.name)}</span></div>`);
+    if(p.id===state.playerId){
+      const info = ROLE_INFO[p.role] || null;
+      chip.appendChild(el(`<span class="you-tag">${info? info.glyph+' '+info.name : 'VOCÊ'}</span>`));
+    }
+    list.appendChild(chip);
+  });
+  return details;
+}
+
+function renderLog(meta){
+  const box = el(`<div class="log-box"></div>`);
+  (meta.log||[]).slice(-8).forEach(line=>{
+    box.appendChild(el(`<p>${esc(line)}</p>`));
+  });
+  return box;
+}
+
+/* ============ boot ============ */
+render();
+</script>
+</body>
+</html>
