@@ -34,6 +34,7 @@ function metaFromRow(row) {
     phaseEndsAt: row.phase_ends_at
       ? new Date(row.phase_ends_at).getTime()
       : null,
+    investigationGameId: row.investigation_game_id || null,
   };
 }
 function rowFromMeta(code, meta) {
@@ -52,6 +53,7 @@ function rowFromMeta(code, meta) {
     phase_ends_at: meta.phaseEndsAt
       ? new Date(meta.phaseEndsAt).toISOString()
       : null,
+    investigation_game_id: meta.investigationGameId || null,
   };
 }
 async function dbGetRoom(code) {
@@ -155,14 +157,280 @@ async function dbSubmitVote(code, round, voterId, targetId) {
 async function dbGetVotes(code, round) {
   const { data, error } = await sb
     .from("votes")
-    .select("target_id")
+    .select("voter_id,target_id")
     .eq("room_code", code)
     .eq("round", round);
   if (error) {
     console.error("dbGetVotes", error);
     return [];
   }
-  return data.map((r) => r.target_id);
+  return (data || []).map((r) => ({
+    voterId: r.voter_id,
+    targetId: r.target_id,
+  }));
+}
+
+/* ============ investigation system ============ */
+async function dbCreateInvestigationGame(code, round, players) {
+  // A história deve permanecer a mesma durante todas as rodadas da partida.
+  // Só as informações distribuídas mudam a cada rodada.
+  const { data: previousGame, error: previousError } = await sb
+    .from("game_investigations")
+    .select("id,scenario_id")
+    .eq("room_code", code)
+    .eq("status", "active")
+    .order("round", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  let chosen = null;
+
+  if (previousError) {
+    console.error("dbCreateInvestigationGame.previous", previousError);
+    return null;
+  }
+
+  if (previousGame?.scenario_id) {
+    const { data: previousScenario, error: previousScenarioError } = await sb
+      .from("investigation_scenarios")
+      .select("id,title,description,truth_summary")
+      .eq("id", previousGame.scenario_id)
+      .maybeSingle();
+    if (previousScenarioError || !previousScenario) {
+      console.error("dbCreateInvestigationGame.previousScenario", previousScenarioError);
+      return null;
+    }
+    chosen = previousScenario;
+  } else {
+    const { data: scenarios, error: scenarioError } = await sb
+      .from("investigation_scenarios")
+      .select("id,title,description,truth_summary")
+      .eq("active", true)
+      .order("id", { ascending: false });
+    if (scenarioError || !scenarios?.length) {
+      console.error("dbCreateInvestigationGame.scenarios", scenarioError);
+      return null;
+    }
+    chosen = scenarios[Math.floor(Math.random() * scenarios.length)];
+  }
+
+  const { data: game, error: gameError } = await sb
+    .from("game_investigations")
+    .insert({ room_code: code, round, scenario_id: chosen.id, status: "active" })
+    .select("id,room_code,round,scenario_id")
+    .single();
+  if (gameError || !game) {
+    console.error("dbCreateInvestigationGame.game", gameError);
+    return null;
+  }
+
+  const { data: facts, error: factsError } = await sb
+    .from("investigation_facts")
+    .select("id,text,category,value,audience")
+    .eq("scenario_id", chosen.id)
+    .eq("active", true)
+    .order("id");
+
+  // O Detetive recebe UMA pista nova por rodada. As pistas anteriores ficam
+  // preservadas e serão mostradas junto com a nova nas rodadas seguintes.
+  const { data: previousClueItems, error: previousClueError } = await sb
+    .from("game_investigations")
+    .select("id")
+    .eq("room_code", code)
+    .eq("status", "active");
+  if (previousClueError) {
+    console.error("dbCreateInvestigationGame.previousGames", previousClueError);
+    return null;
+  }
+
+  const previousGameIds = (previousClueItems || []).map(g => g.id);
+  let usedClueIds = [];
+  if (previousGameIds.length) {
+    const { data: usedClues, error: usedCluesError } = await sb
+      .from("game_investigation_items")
+      .select("source_id")
+      .in("game_id", previousGameIds)
+      .eq("item_type", "clue");
+    if (usedCluesError) {
+      console.error("dbCreateInvestigationGame.usedClues", usedCluesError);
+      return null;
+    }
+    usedClueIds = (usedClues || []).map(item => item.source_id);
+  }
+
+  const { data: availableClues, error: cluesError } = await sb
+    .from("investigation_clues")
+    .select("id,text,category,value,is_true")
+    .eq("scenario_id", chosen.id)
+    .eq("active", true)
+    .order("id");
+
+  if (factsError || cluesError) {
+    console.error("dbCreateInvestigationGame.items", factsError || cluesError);
+    return null;
+  }
+
+  const unusedClues = (availableClues || []).filter(c => !usedClueIds.includes(c.id));
+  const cluePool = unusedClues.length ? unusedClues : (availableClues || []);
+  if (!cluePool.length) {
+    console.error("Pistas insuficientes para o cenário", chosen.id);
+    return null;
+  }
+
+  const newDetectiveClue = shuffle(cluePool)[0];
+
+  const factsByAudience = {
+    cidadao: shuffle((facts || []).filter(f => f.audience === "cidadao" || f.audience === "todos")),
+    anjo: shuffle((facts || []).filter(f => f.audience === "anjo" || f.audience === "todos")),
+    assassino: shuffle((facts || []).filter(f => f.audience === "assassino" || f.audience === "todos")),
+  };
+  if (factsByAudience.cidadao.length < 3 || factsByAudience.anjo.length < 3 || factsByAudience.assassino.length < 3) {
+    console.error("Fatos insuficientes por papel para o cenário", chosen.id);
+    return null;
+  }
+
+  const assignments = [];
+  const addFactsForPlayers = (role, list) => {
+    players.filter(p => p.role === role).forEach(player => {
+      const source = shuffle(list.slice());
+      source.slice(0, 3).forEach((f, i) => assignments.push({
+        game_id: game.id,
+        player_id: player.id,
+        role: player.role,
+        item_type: "fact",
+        source_id: f.id,
+        text_snapshot: f.text,
+        is_true: true,
+        sort_order: i + 1,
+      }));
+    });
+  };
+
+  addFactsForPlayers("cidadao", factsByAudience.cidadao);
+  addFactsForPlayers("anjo", factsByAudience.anjo);
+  addFactsForPlayers("assassino", factsByAudience.assassino);
+
+  const detective = players.find(p => p.role === "detetive");
+  if (detective) {
+    assignments.push({
+      game_id: game.id,
+      player_id: detective.id,
+      role: detective.role,
+      item_type: "clue",
+      source_id: newDetectiveClue.id,
+      text_snapshot: newDetectiveClue.text,
+      is_true: newDetectiveClue.is_true,
+      sort_order: 1,
+    });
+  }
+
+  const { error: assignmentError } = await sb.from("game_investigation_items").insert(assignments);
+  if (assignmentError) {
+    console.error("dbCreateInvestigationGame.assignments", assignmentError);
+    await sb.from("game_investigations").delete().eq("id", game.id);
+    return null;
+  }
+
+  return game;
+}
+
+async function dbGetMyInvestigationItems(gameId, playerId) {
+  if (!gameId || !playerId) return [];
+
+  const { data: currentGame, error: currentGameError } = await sb
+    .from("game_investigations")
+    .select("id,room_code,round")
+    .eq("id", gameId)
+    .maybeSingle();
+  if (currentGameError || !currentGame) {
+    console.error("dbGetMyInvestigationItems.game", currentGameError);
+    return [];
+  }
+
+  const { data: me, error: meError } = await sb
+    .from("players")
+    .select("id,role")
+    .eq("id", playerId)
+    .maybeSingle();
+  if (meError) {
+    console.error("dbGetMyInvestigationItems.player", meError);
+    return [];
+  }
+
+  // Detetive acumula as pistas: uma nova a cada rodada.
+  if (me?.role === "detetive") {
+    const { data: games, error: gamesError } = await sb
+      .from("game_investigations")
+      .select("id,round")
+      .eq("room_code", currentGame.room_code)
+      .order("round");
+    if (gamesError) {
+      console.error("dbGetMyInvestigationItems.games", gamesError);
+      return [];
+    }
+
+    const gameIds = (games || []).map(g => g.id);
+    if (!gameIds.length) return [];
+
+    const { data, error } = await sb
+      .from("game_investigation_items")
+      .select("id,item_type,text_snapshot,is_true,sort_order,game_id")
+      .in("game_id", gameIds)
+      .eq("player_id", playerId)
+      .eq("item_type", "clue")
+      .order("created_at");
+    if (error) {
+      console.error("dbGetMyInvestigationItems.detective", error);
+      return [];
+    }
+    return data || [];
+  }
+
+  // Cidadão, Anjo e Assassino continuam recebendo exatamente 3 fatos por rodada.
+  const { data, error } = await sb
+    .from("game_investigation_items")
+    .select("id,item_type,text_snapshot,is_true,sort_order")
+    .eq("game_id", gameId)
+    .eq("player_id", playerId)
+    .order("item_type")
+    .order("sort_order");
+  if (error) {
+    console.error("dbGetMyInvestigationItems", error);
+    return [];
+  }
+  return data || [];
+}
+
+async function dbGetInvestigationTruth(gameId) {
+  if (!gameId) return null;
+  const { data: game, error: gameError } = await sb
+    .from("game_investigations")
+    .select("id,scenario_id,truth_revealed_at")
+    .eq("id", gameId)
+    .maybeSingle();
+  if (gameError || !game) return null;
+  const { data: scenario, error: scenarioError } = await sb
+    .from("investigation_scenarios")
+    .select("id,title,description,truth_summary")
+    .eq("id", game.scenario_id)
+    .maybeSingle();
+  const { data: facts, error: factsError } = await sb
+    .from("investigation_facts")
+    .select("id,text,category,value")
+    .eq("scenario_id", game.scenario_id)
+    .eq("active", true)
+    .order("id");
+  if (scenarioError || factsError || !scenario) return null;
+  return { ...game, scenario, facts: facts || [] };
+}
+
+async function dbMarkInvestigationFinished(gameId) {
+  if (!gameId) return;
+  const { error } = await sb.from("game_investigations").update({
+    status: "finished",
+    truth_revealed_at: new Date().toISOString(),
+  }).eq("id", gameId);
+  if (error) console.error("dbMarkInvestigationFinished", error);
 }
 
 /* ============ helpers: misc ============ */
@@ -234,53 +502,31 @@ const SESSION_KEY = "cidade-dorme-session-v1";
 
 function saveSession() {
   try {
-    localStorage.setItem(
-      SESSION_KEY,
-      JSON.stringify({
-        playerId: state.playerId,
-        playerName: state.playerName,
-        roomCode: state.roomCode,
-        isHost: state.isHost,
-      }),
-    );
-  } catch (err) {
-    console.warn("Não foi possível salvar a sessão.", err);
-  }
+    localStorage.setItem(SESSION_KEY, JSON.stringify({
+      playerId: state.playerId, playerName: state.playerName,
+      roomCode: state.roomCode, isHost: state.isHost,
+    }));
+  } catch (err) { console.warn("Não foi possível salvar a sessão.", err); }
 }
 function clearSavedSession() {
-  try {
-    localStorage.removeItem(SESSION_KEY);
-  } catch (err) {
-    console.warn("Não foi possível limpar a sessão.", err);
-  }
+  try { localStorage.removeItem(SESSION_KEY); }
+  catch (err) { console.warn("Não foi possível limpar a sessão.", err); }
 }
 function restoreSavedSession() {
   try {
     const saved = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
-    if (!saved?.playerId || !saved?.roomCode || !saved?.playerName)
-      return false;
-    state.playerId = saved.playerId;
-    state.playerName = saved.playerName;
-    state.roomCode = saved.roomCode;
-    state.isHost = !!saved.isHost;
+    if (!saved?.playerId || !saved?.roomCode || !saved?.playerName) return false;
+    state.playerId = saved.playerId; state.playerName = saved.playerName;
+    state.roomCode = saved.roomCode; state.isHost = !!saved.isHost;
     return true;
-  } catch (err) {
-    clearSavedSession();
-    return false;
-  }
+  } catch (err) { clearSavedSession(); return false; }
 }
 async function restoreRoomAfterRefresh() {
   if (!state.roomCode) return false;
   const meta = await dbGetRoom(state.roomCode);
   if (!meta) {
     clearSavedSession();
-    Object.assign(state, {
-      screen: "landing",
-      roomCode: null,
-      isHost: false,
-      room: null,
-      players: [],
-    });
+    Object.assign(state, { screen:"landing", roomCode:null, isHost:false, room:null, players:[] });
     return false;
   }
   const players = await fetchPlayers(state.roomCode);
@@ -288,21 +534,11 @@ async function restoreRoomAfterRefresh() {
   const me = players.find((p) => p.id === state.playerId);
   if (!me) {
     clearSavedSession();
-    Object.assign(state, {
-      screen: "landing",
-      roomCode: null,
-      isHost: false,
-      room: null,
-      players: [],
-      error: "Sua participação nessa sala não foi encontrada.",
-    });
+    Object.assign(state, { screen:"landing", roomCode:null, isHost:false, room:null, players:[], error:"Sua participação nessa sala não foi encontrada." });
     return false;
   }
-  state.room = meta;
-  state.players = players;
-  state.isHost = meta.hostId === state.playerId;
-  state.screen = meta.status === "lobby" ? "lobby" : "game";
-  state.error = "";
+  state.room = meta; state.players = players; state.isHost = meta.hostId === state.playerId;
+  state.screen = meta.status === "lobby" ? "lobby" : "game"; state.error = "";
   saveSession();
   return true;
 }
@@ -339,6 +575,8 @@ const state = {
   refreshInFlight: false,
   refreshQueued: false,
   refreshTimer: null,
+  investigationItems: [],
+  investigationCase: null,
 };
 
 /* ============ room meta shape ============
@@ -364,6 +602,7 @@ async function createRoom(name) {
     discussionSeconds: 60,
     votingSeconds: 45,
     phaseEndsAt: null,
+    investigationGameId: null,
   };
   await dbCreateRoom(code, meta);
   await dbUpsertPlayer(code, {
@@ -469,6 +708,19 @@ async function refreshOnce() {
 
   state.room = meta;
   state.players = players;
+
+  if (meta.status === "active" && meta.investigationGameId) {
+    const me = players.find(p => p.id === state.playerId);
+    state.investigationItems = me ? await dbGetMyInvestigationItems(meta.investigationGameId, me.id) : [];
+    if (meta.phase === "gameover") {
+      state.investigationCase = await dbGetInvestigationTruth(meta.investigationGameId);
+    } else {
+      state.investigationCase = null;
+    }
+  } else {
+    state.investigationItems = [];
+    state.investigationCase = null;
+  }
 
   if (meta.status === "lobby" && state.screen === "game") {
     state.screen = "lobby";
@@ -845,6 +1097,24 @@ async function hostStartGame() {
     "Os papéis foram distribuídos. A cidade se prepara para a primeira noite.",
   ];
 
+  const assignedPlayers = shuffledPlayers.map((p, idx) => ({
+    ...p,
+    role: pool[idx],
+    alive: true,
+  }));
+  const investigationGame = await dbCreateInvestigationGame(
+    state.roomCode,
+    meta.round,
+    assignedPlayers,
+  );
+  if (!investigationGame) {
+    state.busy = false;
+    state.error = "Não foi possível preparar a história e as pistas desta partida.";
+    render();
+    return;
+  }
+  meta.investigationGameId = investigationGame.id;
+
   await dbUpdateRoom(state.roomCode, meta);
 
   state.busy = false;
@@ -1103,7 +1373,27 @@ async function advanceToNextNight() {
     .eq("code", state.roomCode)
     .eq("phase", "day_results");
 
-  if (error) console.error("advanceToNextNight", error);
+  if (error) {
+    console.error("advanceToNextNight", error);
+    return;
+  }
+
+  const players = await fetchPlayers(state.roomCode);
+  const investigationGame = await dbCreateInvestigationGame(
+    state.roomCode,
+    nextRound,
+    players || [],
+  );
+  if (!investigationGame) {
+    console.error("advanceToNextNight: não foi possível criar a nova pista da rodada");
+    return;
+  }
+
+  await sb
+    .from("rooms")
+    .update({ investigation_game_id: investigationGame.id })
+    .eq("code", state.roomCode)
+    .eq("round", nextRound);
 }
 
 async function submitVote(targetId) {
@@ -1115,7 +1405,31 @@ async function submitVote(targetId) {
   );
   state.selectedTarget = targetId;
   render();
+
+  // A votação termina imediatamente quando todos os jogadores vivos votaram.
+  await resolveVotesIfEveryoneVoted();
 }
+
+async function resolveVotesIfEveryoneVoted() {
+  const meta = await dbGetRoom(state.roomCode);
+  if (!meta || meta.phase !== "day_voting") return;
+
+  const players = await fetchPlayers(state.roomCode);
+  const aliveIds = new Set(
+    (players || []).filter((p) => p.alive).map((p) => p.id),
+  );
+  if (!aliveIds.size) return;
+
+  const votes = await dbGetVotes(state.roomCode, meta.round);
+  const votedIds = new Set(
+    votes.filter((v) => aliveIds.has(v.voterId)).map((v) => v.voterId),
+  );
+
+  if (votedIds.size >= aliveIds.size) {
+    await autoResolveVotes();
+  }
+}
+
 async function autoResolveVotes() {
   if (state.busy || !state.room || state.room.phase !== "day_voting") return;
 
@@ -1138,17 +1452,28 @@ async function hostResolveVotes() {
     const round = before.round;
     const players = await fetchPlayers(state.roomCode);
     const votes = await dbGetVotes(state.roomCode, round);
-    const counts = {};
-    votes.forEach((v) => {
-      if (v && v !== "abstain") counts[v] = (counts[v] || 0) + 1;
+    const alivePlayers = players.filter((p) => p.alive);
+    const aliveIds = new Set(alivePlayers.map((p) => p.id));
+
+    // Cada jogador vivo tem um voto. Se não votou, seu voto conta como Pular.
+    const voteByPlayer = new Map(
+      votes
+        .filter((v) => aliveIds.has(v.voterId))
+        .map((v) => [v.voterId, v.targetId]),
+    );
+
+    const counts = { abstain: 0 };
+    alivePlayers.forEach((player) => {
+      const targetId = voteByPlayer.get(player.id) || "abstain";
+      counts[targetId] = (counts[targetId] || 0) + 1;
     });
 
     let eliminatedName = null;
-    if (Object.keys(counts).length) {
-      const t = tally(counts);
-      if (t.winner) {
-        const p = players.find((pl) => pl.id === t.winner);
-        if (p && p.alive) {
+    const t = tally(counts);
+    // Pular só vence se tiver a maior quantidade de votos. Em empate, ninguém é eliminado.
+    if (t.winner && t.winner !== "abstain") {
+      const p = players.find((pl) => pl.id === t.winner);
+      if (p && p.alive) {
           const { data: eliminatedRows, error: eliminateError } = await sb
             .from("players")
             .update({ alive: false })
@@ -1162,7 +1487,6 @@ async function hostResolveVotes() {
           if (eliminatedRows?.length) eliminatedName = eliminatedRows[0].name;
         }
       }
-    }
 
     const updatedPlayers = await fetchPlayers(state.roomCode);
     const current = await dbGetRoom(state.roomCode);
@@ -1175,7 +1499,9 @@ async function hostResolveVotes() {
       : new Date(Date.now() + DAY_RESULTS_SECONDS * 1000).toISOString();
     const logLine = eliminatedName
       ? `A cidade votou e eliminou ${eliminatedName}.`
-      : `Os votos empataram — ninguém foi eliminado.`;
+      : t.winner === "abstain"
+        ? `A maioria escolheu Pular — ninguém foi eliminado.`
+        : `Os votos empataram — ninguém foi eliminado.`;
 
     const nextLog = Array.isArray(current.log) ? current.log.slice() : [];
     if (!nextLog.includes(logLine)) nextLog.push(logLine);
@@ -1214,6 +1540,17 @@ async function hostReplayRoom() {
 
   state.busy = true;
 
+  const previousMeta = await dbGetRoom(state.roomCode);
+  // Encerra todos os registros de investigação ativos desta partida.
+  // Assim a próxima partida pode sortear uma nova história normalmente.
+  await sb
+    .from("game_investigations")
+    .update({
+      status: "finished",
+      truth_revealed_at: new Date().toISOString(),
+    })
+    .eq("room_code", state.roomCode)
+    .eq("status", "active");
   await dbResetPlayersForLobby(state.roomCode);
 
   const meta = await dbGetRoom(state.roomCode);
@@ -1225,6 +1562,7 @@ async function hostReplayRoom() {
     meta.lastDeathName = null;
     meta.lastEliminatedName = null;
     meta.phaseEndsAt = null;
+    meta.investigationGameId = null;
     meta.log = ["A sala foi reiniciada. Todos podem jogar novamente."];
     await dbUpdateRoom(state.roomCode, meta);
   }
@@ -1253,6 +1591,8 @@ function leaveToLanding() {
     selectedTarget: null,
     nightActionConfirmed: false,
     lastPhaseSeen: null,
+    investigationItems: [],
+    investigationCase: null,
   });
   render();
 }
@@ -1384,7 +1724,7 @@ function renderCreate() {
       <h2>Criar sala</h2>
       <div class="field" style="margin-top:16px;">
         <label for="in-name">Seu nome</label>
-        <input id="in-name" maxlength="18" placeholder="Digite um nome" autocomplete="off">
+        <input id="in-name" maxlength="18" placeholder="Lucas" autocomplete="off">
       </div>
       <button class="btn btn-primary" id="btn-go">Criar sala</button>
       <p class="footnote">Um código será gerado automaticamente.</p>
@@ -1475,11 +1815,9 @@ function renderLobby() {
     </div>
     <div class="player-list" id="lobby-players"></div>
 
-    ${
-      players.length < 4
-        ? `<p class="status-line"><span class="pulse"></span>São necessários pelo menos 4 jogadores para começar.</p>`
-        : `<p class="tagline lobby-role-summary">Com ${players.length} jogadores: 1 assassino, 1 detetive, 1 anjo e ${Math.max(1, players.length - 3)} cidadão(s).</p>`
-    }
+    ${players.length < 4
+      ? `<p class="status-line">São necessários pelo menos 4 jogadores para começar.</p>`
+      : `<p class="tagline lobby-role-summary">Com ${players.length} jogadores: 1 assassino, 1 detetive, 1 anjo e ${Math.max(1, players.length - 3)} cidadão(s).</p>`}
 
     <div class="card lobby-settings" style="margin-top:18px;">
       <h3>Configurações da sala</h3>
@@ -1513,11 +1851,9 @@ function renderLobby() {
 
     <hr class="divider">
 
-    ${
-      state.isHost
-        ? `<button class="btn btn-primary" id="btn-start" ${canStart ? "" : "disabled"}>${state.busy ? "Iniciando..." : "Iniciar jogo"}</button>`
-        : `<p class="waiting-block"><span class="status-dot"></span>Aguardando o anfitrião iniciar o jogo...</p>`
-    }
+    ${state.isHost
+      ? `<button class="btn btn-primary" id="btn-start" ${canStart ? "" : "disabled"}>${state.busy ? "Iniciando..." : "Iniciar jogo"}</button>`
+      : `<p class="waiting-block">Aguardando o anfitrião iniciar o jogo...</p>`}
     <p class="error-msg">${esc(state.error)}</p>
   </div>`);
 
@@ -1527,8 +1863,7 @@ function renderLobby() {
       `<div class="player-chip">
         <span class="num-badge">${i + 1}</span>
         <span>${esc(p.name)}</span>
-        <span class="dot"></span>
-      </div>`,
+        </div>`,
     );
     if (p.id === state.playerId) {
       chip.appendChild(el(`<span class="you-tag">VOCÊ</span>`));
@@ -1558,10 +1893,6 @@ function renderLobby() {
 
 function myPlayer() {
   return (state.players || []).find((p) => p.id === state.playerId) || null;
-}
-
-function aliveOthers(playerId) {
-  return (state.players || []).filter((p) => p.alive && p.id !== playerId);
 }
 
 function renderGame() {
@@ -1728,6 +2059,13 @@ function renderNightTransition(meta) {
   return wrap;
 }
 
+function renderInvestigationItemsHtml(me) {
+  const items = state.investigationItems || [];
+  if (!items.length) return "";
+  const title = me.role === "detetive" ? "🔎 Suas pistas" : me.role === "assassino" ? "🔪 O que você sabe sobre sua noite" : "📜 Seus fatos";
+  return `<div class="investigation-private-info"><div class="investigation-private-title">${title}</div><ol>${items.map(item => `<li>${esc(item.text_snapshot)}</li>`).join("")}</ol>${me.role === "detetive" ? `<small>Uma das pistas é verdadeira e duas são falsas. Você não sabe qual.</small>` : `<small>Essas informações fazem parte da história desta partida.</small>`}</div>`;
+}
+
 function renderRoleReveal(meta, me) {
   const info = ROLE_INFO[me.role] || ROLE_INFO.cidadao;
   const image = ROLE_IMAGES[me.role] || ROLE_IMAGES.cidadao;
@@ -1739,6 +2077,7 @@ function renderRoleReveal(meta, me) {
       <p class="role-you">Você é</p>
       <h1 class="role-name role-${esc(me.role)}">${esc(info.name)}</h1>
       <p class="tagline role-description">${esc(info.desc)}</p>
+      ${renderInvestigationItemsHtml(me)}
       <div class="role-countdown" id="role-countdown">5</div>
       <p class="footnote">O jogo começa em instantes.</p>
     </div>
@@ -1795,6 +2134,12 @@ function roleActionIcon(role, size = 46) {
     cidadao: `<circle cx="24" cy="17" r="7"/><path d="M11 40c1-9 7-13 13-13s12 4 13 13"/>`,
   };
   return `<svg class="role-action-icon" width="${size}" height="${size}" viewBox="0 0 48 48" fill="none" stroke="${stroke}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[role] || paths.cidadao}</svg>`;
+}
+
+function aliveOthers(playerId) {
+  return (state.players || []).filter(
+    (p) => p.alive && p.id !== playerId,
+  );
 }
 
 function renderNightPanel(meta, me) {
@@ -1924,12 +2269,21 @@ function renderDayReveal(meta, me) {
   return card;
 }
 
+function renderInvestigationPanelHtml(me) {
+  const items = state.investigationItems || [];
+  if (!items.length) return "";
+  const title = me.role === "detetive" ? "🔎 Suas pistas" : me.role === "assassino" ? "🔪 O que você sabe" : "📜 Seus fatos";
+  const note = me.role === "detetive" ? "Uma é verdadeira e duas são falsas. O sistema não revela qual." : "Essas informações são verdadeiras dentro da história desta partida.";
+  return `<div class="investigation-panel"><div class="investigation-panel-title">${title}</div><ol>${items.map(item => `<li>${esc(item.text_snapshot)}</li>`).join("")}</ol><small>${note}</small></div>`;
+}
+
 function renderDiscussion(meta, me) {
   const card = el(`<div class="card discussion-card">
     <div class="discussion-head">
       ${sunSvg(42)}
       <div><p class="eyebrow">FASE DE DISCUSSÃO</p><h2>Conversem e descubram os assassinos.</h2></div>
     </div>
+    ${renderInvestigationPanelHtml(me)}
     <div class="timer-panel"><span>Tempo restante</span><strong id="timer-display">--:--</strong></div>
     <p class="footnote">A discussão termina automaticamente. Depois começa a votação.</p>
   </div>`);
@@ -1982,6 +2336,12 @@ function renderDayResults(meta, me) {
   return card;
 }
 
+function renderTruthHtml() {
+  const truth = state.investigationCase;
+  if (!truth?.scenario) return `<div class="card truth-card"><h3>A história verdadeira</h3><p class="footnote">A história desta partida não foi carregada. Verifique se o banco de investigação foi criado corretamente.</p></div>`;
+  return `<div class="card truth-card"><p class="eyebrow">A VERDADE DO CASO</p><h2>${esc(truth.scenario.title)}</h2><p class="truth-summary">${esc(truth.scenario.truth_summary || truth.scenario.description || "")}</p><div class="truth-facts"><h3>O que realmente aconteceu</h3><ol>${truth.facts.map(f => `<li>${esc(f.text)}</li>`).join("")}</ol></div></div>`;
+}
+
 function renderGameOver() {
   const meta = state.room;
   const cidadeVenceu = meta.winner === "cidade";
@@ -2001,6 +2361,8 @@ function renderGameOver() {
         <h3>Papéis da partida</h3>
         <div class="player-list" id="final-roles"></div>
       </div>
+
+      ${renderTruthHtml()}
 
       ${
         state.isHost
@@ -2596,11 +2958,7 @@ document.addEventListener("pointerdown", unlockAudio, { passive: true });
 (async function boot() {
   if (restoreSavedSession()) {
     const restored = await restoreRoomAfterRefresh();
-    if (restored) {
-      render();
-      startPolling();
-      return;
-    }
+    if (restored) { render(); startPolling(); return; }
   }
   render();
 })();

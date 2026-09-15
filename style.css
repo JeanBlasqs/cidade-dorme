@@ -30,11 +30,7 @@ body {
   font-family: var(--sans);
   color: var(--ink);
   background:
-    radial-gradient(
-      ellipse at 50% 0%,
-      rgba(240, 180, 41, 0.08),
-      transparent 42%
-    ),
+    radial-gradient(ellipse at 50% 0%, rgba(240, 180, 41, 0.08), transparent 42%),
     linear-gradient(180deg, var(--bg-0) 0%, var(--bg-1) 55%, #0a1030 100%);
   min-height: 100%;
   -webkit-font-smoothing: antialiased;
@@ -125,7 +121,7 @@ p {
   letter-spacing: 0.08em;
 }
 
-.skyline-hero {
+ .skyline-hero {
   position: relative;
   overflow: hidden;
   border-radius: var(--radius);
@@ -137,7 +133,7 @@ p {
   justify-content: flex-end;
   background-color: #050a20;
   background-image: url("assets/home-bg.png");
-  background-size: cover;
+  background-size: 100% 100%;
   background-position: center center;
   background-repeat: no-repeat;
   border: 1px solid #2d3670;
@@ -151,7 +147,7 @@ p {
   pointer-events: none;
   background: linear-gradient(
     180deg,
-    rgba(4, 8, 28, 0.1) 0%,
+    rgba(4, 8, 28, 0.10) 0%,
     rgba(4, 8, 28, 0.14) 48%,
     rgba(4, 8, 28, 0.34) 100%
   );
@@ -284,19 +280,6 @@ button {
   min-height: 1.1em;
   margin-top: 8px;
 }
-.status-line {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  gap: 8px;
-}
-
-#btn-join {
-  background: #181f2e;
-  border-color: #9ca3af;
-  color: #fff;
-}
 
 .player-list,
 .target-grid {
@@ -332,17 +315,6 @@ button {
   font-weight: 700;
   background: #2a3270;
   color: #d7dcff;
-}
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--green);
-  margin-left: auto;
-  box-shadow: 0 0 8px rgba(61, 206, 122, 0.5);
-}
-.player-chip.dead .dot {
-  background: var(--red);
 }
 .you-tag,
 .host-tag {
@@ -410,11 +382,7 @@ button {
   flex-direction: column;
   padding: 18px 16px 0;
   background:
-    radial-gradient(
-      circle at 50% 18%,
-      rgba(255, 210, 120, 0.12),
-      transparent 30%
-    ),
+    radial-gradient(circle at 50% 18%, rgba(255, 210, 120, 0.12), transparent 30%),
     linear-gradient(180deg, #10163f 0%, #0a102c 100%);
 }
 .reveal-heading {
@@ -681,15 +649,41 @@ button {
 }
 
 @media (max-width: 520px) {
+  .wrap {
+    padding: 10px 10px 24px;
+  }
   .skyline-hero {
     aspect-ratio: 1536 / 1024;
-    padding: 28px 18px 20px;
+    min-height: calc(100dvh - 34px);
+    padding: 24px 14px 22px;
+    justify-content: flex-end;
+    background-size: 100% 100%;
+  }
+  .hero-copy {
+    width: min(100%, 360px);
+    margin-bottom: 2px;
   }
   .hero-copy h1 {
-    font-size: clamp(2rem, 10vw, 2.7rem);
+    font-size: clamp(2rem, 11vw, 2.65rem);
   }
   .hero-kicker {
-    max-width: 300px;
+    max-width: 320px;
+    margin: 10px auto 16px;
+    font-size: .66rem;
+    line-height: 1.45;
+  }
+  .hero-actions {
+    width: 100%;
+    gap: 8px;
+    margin-top: 4px;
+  }
+  .hero-actions .btn {
+    min-height: 48px;
+    padding: 12px 14px;
+  }
+  .hero-foot {
+    margin-top: 12px;
+    font-size: .6rem;
   }
 }
 
@@ -699,6 +693,27 @@ button {
   }
   .timer-xl {
     font-size: 2rem;
+  }
+}
+
+
+@media (max-width: 520px) {
+  .wrap > .card {
+    width: 100%;
+    padding: 16px;
+  }
+  .field input,
+  .field select {
+    width: 100%;
+    min-height: 48px;
+    font-size: 16px;
+  }
+  .field input.code-input {
+    font-size: 1.15rem;
+    letter-spacing: .2em;
+  }
+  .wrap > .card .btn {
+    min-height: 48px;
   }
 }
 
@@ -730,11 +745,7 @@ button {
   margin: 0 auto;
   padding: 28px 24px 24px;
   text-align: center;
-  background: linear-gradient(
-    180deg,
-    rgba(23, 29, 72, 0.96),
-    rgba(28, 35, 84, 0.96)
-  );
+  background: linear-gradient(180deg, rgba(23, 29, 72, 0.96), rgba(28, 35, 84, 0.96));
   border: 1px solid var(--line);
   border-radius: var(--radius);
   box-shadow: 0 18px 45px rgba(0, 0, 0, 0.28);
@@ -778,4 +789,121 @@ button {
   margin: 12px auto 0;
   width: min(100%, 720px);
   text-align: center;
+}
+
+/* ===== Investigação / história ===== */
+.investigation-panel,
+.investigation-private-info {
+  margin: 16px 0;
+  padding: 16px;
+  border: 1px solid rgba(242, 192, 120, .28);
+  border-radius: 14px;
+  background: rgba(4, 17, 39, .72);
+}
+.investigation-panel-title,
+.investigation-private-title {
+  color: var(--gold-2, #f6c85a);
+  font-family: var(--serif, Georgia, serif);
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+.investigation-panel ol,
+.investigation-private-info ol,
+.truth-facts ol {
+  margin: 8px 0 0;
+  padding-left: 24px;
+}
+.investigation-panel li,
+.investigation-private-info li,
+.truth-facts li {
+  margin: 8px 0;
+  color: var(--ink, #f3f0e8);
+  line-height: 1.45;
+}
+.investigation-panel small,
+.investigation-private-info small {
+  display: block;
+  margin-top: 12px;
+  color: var(--muted, #9aa3d4);
+  line-height: 1.4;
+}
+.truth-card {
+  margin-top: 14px;
+  border-color: rgba(242, 192, 120, .45) !important;
+  background: linear-gradient(180deg, rgba(19, 31, 60, .95), rgba(6, 17, 39, .94)) !important;
+}
+.truth-card h2 {
+  color: var(--gold-2, #f6c85a);
+  margin-top: 4px;
+}
+.truth-summary {
+  margin-top: 12px;
+  color: var(--ink, #f3f0e8);
+  line-height: 1.6;
+}
+.truth-facts {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(120, 154, 216, .18);
+}
+.truth-facts h3 {
+  margin-bottom: 6px;
+}
+@media (max-width: 640px) {
+  .wrap {
+    width: 100%;
+    padding: 12px 12px 24px;
+  }
+  .cd-header {
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .cd-meta {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+  .skyline-hero {
+    width: 100%;
+    min-height: 76vh;
+    aspect-ratio: auto;
+    padding: 24px 16px 22px;
+    background-size: cover;
+    background-position: center;
+  }
+  .hero-copy {
+    width: 100%;
+  }
+  .hero-copy h1 {
+    font-size: clamp(2.5rem, 13vw, 4.2rem);
+    line-height: .92;
+  }
+  .hero-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .hero-actions .btn,
+  .home-menu-card .btn,
+  .card > .btn {
+    width: 100%;
+    min-height: 50px;
+  }
+  .card {
+    width: 100%;
+    padding: 18px 15px !important;
+  }
+  .field input,
+  .field select,
+  input.code-input {
+    width: 100%;
+    min-height: 50px;
+    font-size: 16px;
+  }
+  .investigation-panel,
+  .investigation-private-info {
+    padding: 13px;
+  }
+  .truth-card h2 {
+    font-size: 1.35rem;
+  }
 }
