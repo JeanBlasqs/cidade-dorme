@@ -225,6 +225,75 @@ async function dbGetMyVote(code, round, playerId) {
 }
 
 /* ============ investigation system ============ */
+async function dbEnsureInitialInvestigationFacts(game, players) {
+  if (!game?.id || Number(game.round) !== 1 || !players?.length) return;
+
+  const { data: facts, error: factsError } = await sb
+    .from("investigation_facts")
+    .select("id,text,audience")
+    .eq("scenario_id", game.scenario_id)
+    .eq("active", true)
+    .order("id");
+
+  if (factsError) {
+    console.error("dbEnsureInitialInvestigationFacts.facts", factsError);
+    return;
+  }
+
+  for (const player of players.filter(p => ["cidadao", "anjo", "assassino"].includes(p.role))) {
+    const { data: existing, error: existingError } = await sb
+      .from("game_investigation_items")
+      .select("source_id")
+      .eq("game_id", game.id)
+      .eq("player_id", player.id)
+      .eq("item_type", "fact");
+
+    if (existingError) {
+      console.error("dbEnsureInitialInvestigationFacts.existing", existingError);
+      continue;
+    }
+
+    const used = new Set((existing || []).map(item => item.source_id));
+    const missing = Math.max(0, 3 - used.size);
+    if (!missing) continue;
+
+    // Primeiro usa os 3 fatos específicos do papel. O fato "todos" é reserva.
+    // O último fallback evita deixar o jogador sem fatos caso o seed tenha
+    // sido alterado ou algum fato específico esteja faltando.
+    const candidates = shuffle([
+      ...(facts || []).filter(f => f.audience === player.role && !used.has(f.id)),
+      ...(facts || []).filter(f => f.audience === "todos" && !used.has(f.id)),
+      ...(facts || []).filter(f => !used.has(f.id)),
+    ]);
+
+    const rows = [];
+    for (const fact of candidates) {
+      if (used.has(fact.id)) continue;
+      rows.push({
+        game_id: game.id,
+        player_id: player.id,
+        role: player.role,
+        item_type: "fact",
+        source_id: fact.id,
+        text_snapshot: fact.text,
+        is_true: true,
+        sort_order: used.size + rows.length + 1,
+      });
+      used.add(fact.id);
+      if (rows.length >= missing) break;
+    }
+
+    if (rows.length) {
+      const { error: insertError } = await sb
+        .from("game_investigation_items")
+        .insert(rows);
+      if (insertError) {
+        console.error("dbEnsureInitialInvestigationFacts.insert", insertError);
+      }
+    }
+  }
+}
+
 async function dbCreateInvestigationGame(code, round, players) {
   // A história deve permanecer a mesma durante todas as rodadas da partida.
   // Só as informações distribuídas mudam a cada rodada.
@@ -291,7 +360,15 @@ async function dbCreateInvestigationGame(code, round, players) {
         .limit(1)
         .maybeSingle();
 
-      if (!existingGameError && existingGame) return existingGame;
+      if (!existingGameError && existingGame) {
+        // A investigação pode já ter sido criada por outro navegador. Mesmo
+        // assim, não retornamos imediatamente: garantimos que os fatos dos
+        // jogadores desta partida estejam gravados. Isso corrige partidas em
+        // que a investigação existia, mas a distribuição dos fatos ficou
+        // incompleta.
+        await dbEnsureInitialInvestigationFacts(existingGame, players);
+        return existingGame;
+      }
     }
 
     console.error("dbCreateInvestigationGame.game", gameError);
@@ -419,60 +496,9 @@ async function dbCreateInvestigationGame(code, round, players) {
   }
 
   // Garantia de integridade: cada jogador que não é Detetive deve ter
-  // exatamente 3 fatos na primeira rodada. Isso protege contra dados antigos
-  // ou uma falha parcial de gravação durante testes/replays.
-  if (Number(round) === 1) {
-    for (const player of players.filter(p => ["cidadao", "anjo", "assassino"].includes(p.role))) {
-      const { data: existingFacts, error: existingFactsError } = await sb
-        .from("game_investigation_items")
-        .select("source_id")
-        .eq("game_id", game.id)
-        .eq("player_id", player.id)
-        .eq("item_type", "fact");
-
-      if (existingFactsError) {
-        console.error("dbCreateInvestigationGame.verifyFacts", existingFactsError);
-        continue;
-      }
-
-      const existingIds = new Set((existingFacts || []).map(f => f.source_id));
-      const missing = Math.max(0, 3 - existingIds.size);
-      if (!missing) continue;
-
-      // Primeiro tenta fatos do próprio papel, depois fatos gerais do cenário.
-      // Nunca repete um fato para o mesmo jogador.
-      const candidates = shuffle([
-        ...(facts || []).filter(f => f.audience === player.role && !existingIds.has(f.id)),
-        ...(facts || []).filter(f => f.audience === "todos" && !existingIds.has(f.id)),
-        ...(facts || []).filter(f => !existingIds.has(f.id)),
-      ]);
-
-      const fallback = [];
-      const used = new Set(existingIds);
-      for (const fact of candidates) {
-        if (used.has(fact.id)) continue;
-        fallback.push({
-          game_id: game.id,
-          player_id: player.id,
-          role: player.role,
-          item_type: "fact",
-          source_id: fact.id,
-          text_snapshot: fact.text,
-          is_true: true,
-          sort_order: existingIds.size + fallback.length + 1,
-        });
-        used.add(fact.id);
-        if (fallback.length >= missing) break;
-      }
-
-      if (fallback.length) {
-        const { error: fallbackError } = await sb
-          .from("game_investigation_items")
-          .insert(fallback);
-        if (fallbackError) console.error("dbCreateInvestigationGame.fallbackFacts", fallbackError);
-      }
-    }
-  }
+  // exatamente 3 fatos na primeira rodada. Isso também repara uma criação
+  // parcial sem depender de qual navegador iniciou a partida.
+  await dbEnsureInitialInvestigationFacts(game, players);
 
   return game;
 }
@@ -1298,6 +1324,18 @@ async function hostStartGame() {
     alive: true,
     readyRound: 0,
   }));
+  // A rodada 1 de uma nova partida nunca deve reaproveitar uma investigação
+  // ativa de um teste/replay anterior. Finalizamos qualquer sobra antes de
+  // criar a investigação desta nova partida.
+  await sb
+    .from("game_investigations")
+    .update({
+      status: "finished",
+      truth_revealed_at: new Date().toISOString(),
+    })
+    .eq("room_code", state.roomCode)
+    .eq("status", "active");
+
   const investigationGame = await dbCreateInvestigationGame(
     state.roomCode,
     meta.round,
@@ -2374,7 +2412,6 @@ function renderRoleReveal(meta, me) {
         readyButton.textContent = "✓ Pronto";
         card.querySelector("#ready-status").textContent = "Você já confirmou que está pronto.";
         updateReadyCount();
-        await refresh();
       } else {
         readyButton.disabled = false;
       }
