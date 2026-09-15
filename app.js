@@ -788,7 +788,9 @@ async function updateRoomSettings(discussionSeconds, votingSeconds) {
 
   await dbUpdateRoom(state.roomCode, meta);
   state.room = meta;
-  render();
+  // Não renderiza novamente aqui. O render imediato recriava o <select>
+  // enquanto o navegador ainda estava abrindo o menu, fazendo o primeiro
+  // clique abrir e fechar. O Realtime já atualiza os demais clientes.
 }
 
 async function joinRoom(code, name) {
@@ -955,7 +957,6 @@ async function refreshOnce() {
       name: p.name,
       alive: p.alive,
       role: p.role,
-      readyRound: p.readyRound,
     })),
   });
 
@@ -968,6 +969,13 @@ async function refreshOnce() {
   if (shouldRender) {
     render();
     state.lastDataSignature = signature;
+  }
+
+  // A confirmação de outro jogador só altera o contador de prontos.
+  // Não recriamos a tela inteira, evitando saltos de scroll e interferência
+  // enquanto o jogador lê ou interage com a tela.
+  if (meta.phase === "role_reveal" && state.screen === "game") {
+    updateReadyCountDisplay(players, meta.round);
   }
 
   if (
@@ -1777,6 +1785,7 @@ async function hostReplayRoom() {
   if (meta) {
     meta.status = "lobby";
     meta.phase = null;
+    meta.round = 0;
     meta.winner = null;
     meta.lastDeathName = null;
     meta.lastEliminatedName = null;
@@ -2311,6 +2320,21 @@ function renderInvestigationItemsHtml(me, meta) {
   </div>`;
 }
 
+function updateReadyCountDisplay(players, round) {
+  const readyCount = document.querySelector("#ready-count");
+  if (!readyCount) return;
+
+  const participants = (players || []).filter((p) => p.alive);
+  const ready = participants.filter(
+    (p) => Number(p.readyRound || 0) === Number(round),
+  ).length;
+  const total = participants.length;
+
+  readyCount.textContent = total
+    ? `${ready}/${total} jogadores prontos`
+    : "Aguardando jogadores...";
+}
+
 function renderRoleReveal(meta, me) {
   const firstRound = Number(meta.round || 1) === 1;
   const info = ROLE_INFO[me.role] || ROLE_INFO.cidadao;
@@ -2337,15 +2361,9 @@ function renderRoleReveal(meta, me) {
   </div>`);
 
   const readyButton = card.querySelector("#btn-ready");
-  const readyCount = card.querySelector("#ready-count");
 
-  const updateReadyCount = async () => {
-    const players = await fetchPlayers(state.roomCode);
-    const participants = (players || []).filter(p => p.alive);
-    const ready = participants.filter(p => Number(p.readyRound || 0) === Number(meta.round)).length;
-    const total = participants.length;
-    readyCount.textContent = total ? `${ready}/${total} jogadores prontos` : "Aguardando jogadores...";
-    if (readyButton && ready === total && total > 0) await tryAdvanceRoleReveal();
+  const updateReadyCount = () => {
+    updateReadyCountDisplay(state.players, meta.round);
   };
 
   if (readyButton && Number(me.readyRound || 0) !== Number(meta.round)) {
@@ -2355,7 +2373,7 @@ function renderRoleReveal(meta, me) {
       if (ok) {
         readyButton.textContent = "✓ Pronto";
         card.querySelector("#ready-status").textContent = "Você já confirmou que está pronto.";
-        await updateReadyCount();
+        updateReadyCount();
         await refresh();
       } else {
         readyButton.disabled = false;
