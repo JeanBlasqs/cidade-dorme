@@ -1350,11 +1350,13 @@ async function dbClearMatchActions(code) {
   // Não basta o DELETE não retornar erro: em caso de policy/RLS inadequada,
   // o Supabase pode simplesmente não afetar nenhuma linha. Conferimos se
   // realmente não sobrou ação da sala antes de permitir uma nova partida.
-  const [{ data: remainingNight, error: checkNightError }, { data: remainingVotes, error: checkVoteError }] =
-    await Promise.all([
-      sb.from("night_actions").select("room_code").eq("room_code", code).limit(1),
-      sb.from("votes").select("room_code").eq("room_code", code).limit(1),
-    ]);
+  const [
+    { data: remainingNight, error: checkNightError },
+    { data: remainingVotes, error: checkVoteError },
+  ] = await Promise.all([
+    sb.from("night_actions").select("room_code").eq("room_code", code).limit(1),
+    sb.from("votes").select("room_code").eq("room_code", code).limit(1),
+  ]);
 
   if (checkNightError || checkVoteError) {
     console.error("dbClearMatchActions.verify", {
@@ -2248,7 +2250,7 @@ function renderCreate() {
       <h2>Criar sala</h2>
       <div class="field" style="margin-top:16px;">
         <label for="in-name">Seu nome</label>
-        <input id="in-name" maxlength="18" placeholder="Lucas" autocomplete="off">
+        <input id="in-name" maxlength="18" placeholder="Digite seu nome" autocomplete="off">
       </div>
       <button class="btn btn-primary" id="btn-go">Criar sala</button>
       <p class="footnote">Um código será gerado automaticamente.</p>
@@ -2352,7 +2354,7 @@ function renderLobby() {
       <div class="field" style="margin-top:14px;">
         <label for="discussion-time">Tempo de discussão</label>
         <select id="discussion-time" ${state.isHost ? "" : "disabled"}>
-          ${[30, 45, 60, 90, 120, 180]
+          ${[15, 30, 45, 60, 90, 120, 180]
             .map(
               (v) =>
                 `<option value="${v}" ${Number(discussionSeconds) === v ? "selected" : ""}>${v} segundos</option>`,
