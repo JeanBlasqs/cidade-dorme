@@ -596,6 +596,7 @@ async function dbGetMyInvestigationItems(gameId, playerId) {
   const { data: me, error: meError } = await sb
     .from("players")
     .select("id,role")
+    .eq("room_code", currentGame.room_code)
     .eq("id", playerId)
     .maybeSingle();
 
@@ -617,6 +618,7 @@ async function dbGetMyInvestigationItems(gameId, playerId) {
       .from("game_investigations")
       .select("id,round")
       .eq("room_code", currentGame.room_code)
+      .eq("status", "active")
       .order("round", { ascending: true });
 
     if (gamesError) {
