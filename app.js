@@ -148,7 +148,12 @@ async function tryAdvanceRoleReveal() {
     .eq("code", state.roomCode)
     .eq("phase", "role_reveal")
     .eq("round", round);
-  if (error) console.error("tryAdvanceRoleReveal", error);
+  if (error) {
+    console.error("tryAdvanceRoleReveal", error);
+    return false;
+  }
+  await refresh();
+  return true;
 }
 
 async function dbSubmitNightAction(code, round, role, playerId, targetId) {
@@ -204,6 +209,20 @@ async function dbGetVotes(code, round) {
     targetId: r.target_id,
   }));
 }
+async function dbGetMyVote(code, round, playerId) {
+  const { data, error } = await sb
+    .from("votes")
+    .select("target_id")
+    .eq("room_code", code)
+    .eq("round", round)
+    .eq("voter_id", playerId)
+    .maybeSingle();
+  if (error) {
+    console.error("dbGetMyVote", error);
+    return null;
+  }
+  return data?.target_id ?? null;
+}
 
 /* ============ investigation system ============ */
 async function dbCreateInvestigationGame(code, round, players) {
@@ -249,12 +268,32 @@ async function dbCreateInvestigationGame(code, round, players) {
     chosen = scenarios[Math.floor(Math.random() * scenarios.length)];
   }
 
+  // A criação da investigação pode ser disparada por mais de um navegador
+  // ao mesmo tempo. O banco possui uma restrição única por sala/rodada para
+  // impedir que a mesma rodada receba duas pistas novas por uma corrida.
   const { data: game, error: gameError } = await sb
     .from("game_investigations")
     .insert({ room_code: code, round, scenario_id: chosen.id, status: "active" })
     .select("id,room_code,round,scenario_id")
     .single();
+
   if (gameError || !game) {
+    // Se outro navegador acabou de criar esta rodada, reutilizamos aquela
+    // investigação em vez de criar uma segunda e adicionar outra pista.
+    if (gameError?.code === "23505") {
+      const { data: existingGame, error: existingGameError } = await sb
+        .from("game_investigations")
+        .select("id,room_code,round,scenario_id")
+        .eq("room_code", code)
+        .eq("round", round)
+        .eq("status", "active")
+        .order("id", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!existingGameError && existingGame) return existingGame;
+    }
+
     console.error("dbCreateInvestigationGame.game", gameError);
     return null;
   }
@@ -615,6 +654,7 @@ const state = {
   error: "",
   busy: false,
   selectedTarget: null,
+  voteConfirmed: false,
   nightActionConfirmed: false,
   pollHandle: null,
   lastPhaseSeen: null,
@@ -785,6 +825,7 @@ async function refreshOnce() {
   if (meta.status === "lobby" && state.screen === "game") {
     state.screen = "lobby";
     state.selectedTarget = null;
+    state.voteConfirmed = false;
     state.nightActionConfirmed = false;
     state.lastPhaseSeen = null;
     state.phaseClientDeadline = null;
@@ -792,6 +833,7 @@ async function refreshOnce() {
   } else if (meta.status === "active" && state.screen !== "game") {
     state.screen = "game";
     state.selectedTarget = null;
+    state.voteConfirmed = false;
     state.nightActionConfirmed = false;
   }
 
@@ -799,6 +841,7 @@ async function refreshOnce() {
 
   if (phaseChanged) {
     state.selectedTarget = null;
+    state.voteConfirmed = false;
     state.nightActionConfirmed = false;
     state.lastPhaseSeen = meta.phase;
 
@@ -811,8 +854,9 @@ async function refreshOnce() {
 
     // Cada navegador inicia o relógio visual no momento em que recebe a fase.
     // Isso evita diferenças causadas pelo relógio local dos aparelhos.
-    const duration = getPhaseDuration(meta);
-    state.phaseClientDeadline = duration ? Date.now() + duration * 1000 : null;
+    // O servidor define o instante exato de término. Assim todos os jogadores
+    // enxergam a mesma contagem, mesmo entrando na fase alguns segundos depois.
+    state.phaseClientDeadline = meta.phaseEndsAt || null;
   }
 
   const me = (state.players || []).find((p) => p.id === state.playerId);
@@ -828,6 +872,14 @@ async function refreshOnce() {
     if (ownAction) {
       state.selectedTarget = ownAction.targetId;
       state.nightActionConfirmed = true;
+    }
+  }
+
+  if (meta.phase === "day_voting" && me?.alive) {
+    const savedVote = await dbGetMyVote(state.roomCode, meta.round, state.playerId);
+    if (savedVote !== null) {
+      state.selectedTarget = savedVote;
+      state.voteConfirmed = true;
     }
   }
 
@@ -926,7 +978,7 @@ function startPhaseTimer(meta) {
   if (!duration && !meta.phaseEndsAt) return;
 
   if (!state.phaseClientDeadline) {
-    state.phaseClientDeadline = Date.now() + duration * 1000;
+    state.phaseClientDeadline = meta.phaseEndsAt || (duration ? Date.now() + duration * 1000 : null);
   }
 
   const check = async () => {
@@ -941,17 +993,31 @@ function startPhaseTimer(meta) {
 
     state.phaseTimerHandle = null;
 
-    if (current.phase === "night_transition") {
+    // Pequena pausa depois do 00:00 para a mudança de tela não parecer
+    // instantânea/cortada. O relógio já chegou a zero, mas a próxima ação
+    // só acontece após este intervalo curto.
+    await new Promise((resolve) => setTimeout(resolve, 850));
+
+    const latest = await dbGetRoom(state.roomCode);
+    if (!latest || latest.phase !== current.phase) {
+      await refresh();
+      return;
+    }
+
+    if (latest.phase === "night_transition") {
       await dbAdvancePhase(state.roomCode, "night_transition", "night");
-    } else if (current.phase === "day_reveal") {
+    } else if (latest.phase === "day_reveal") {
       await dbAdvancePhase(state.roomCode, "day_reveal", "day_discussion");
-    } else if (current.phase === "day_discussion") {
+    } else if (latest.phase === "day_discussion") {
       await dbAdvancePhase(state.roomCode, "day_discussion", "day_voting");
-    } else if (current.phase === "day_voting") {
+    } else if (latest.phase === "day_voting") {
       await autoResolveVotes();
-    } else if (current.phase === "day_results") {
+    } else if (latest.phase === "day_results") {
       await advanceToNextNight();
     }
+
+    // Não dependemos exclusivamente do realtime para mostrar a nova tela.
+    await refresh();
   };
 
   check();
@@ -975,7 +1041,11 @@ async function dbAdvancePhase(code, fromPhase, toPhase) {
     .eq("code", code)
     .eq("phase", fromPhase);
 
-  if (error) console.error("dbAdvancePhase", error);
+  if (error) {
+    console.error("dbAdvancePhase", error);
+    return false;
+  }
+  return true;
 }
 
 function getNextPhaseDuration(meta, phase) {
@@ -990,7 +1060,7 @@ function getNextPhaseDuration(meta, phase) {
 async function dbResetPlayersForLobby(code) {
   const { error } = await sb
     .from("players")
-    .update({ alive: true, role: null })
+    .update({ alive: true, role: null, ready_round: 0 })
     .eq("room_code", code);
 
   if (error) console.error("dbResetPlayersForLobby", error);
@@ -1179,6 +1249,7 @@ async function hostStartGame() {
 
   state.busy = false;
   state.selectedTarget = null;
+  state.voteConfirmed = false;
   state.nightActionConfirmed = false;
   state.lastPhaseSeen = null;
 
@@ -1419,38 +1490,63 @@ async function advanceToNextNight() {
   const line = `A cidade se prepara para a rodada ${nextRound}.`;
   if (!nextLog.includes(line)) nextLog.push(line);
 
-  const { error } = await sb
+  const players = await fetchPlayers(state.roomCode);
+  if (!players?.length) return;
+
+  // Primeiro preparamos a investigação completa da próxima rodada.
+  // Só depois trocamos a sala para role_reveal. Isso impede que os jogadores
+  // recebam a tela de revelação antes da nova pista do Detetive existir.
+  let investigationGame = null;
+  const { data: existingGame, error: existingError } = await sb
+    .from("game_investigations")
+    .select("id,room_code,round,scenario_id")
+    .eq("room_code", state.roomCode)
+    .eq("round", nextRound)
+    .order("id", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (existingError) {
+    console.error("advanceToNextNight.existingGame", existingError);
+    return;
+  }
+
+  if (existingGame) {
+    investigationGame = existingGame;
+  } else {
+    investigationGame = await dbCreateInvestigationGame(
+      state.roomCode,
+      nextRound,
+      players,
+    );
+  }
+
+  if (!investigationGame) {
+    console.error("advanceToNextNight: não foi possível criar a nova pista da rodada");
+    return;
+  }
+
+  // A troca de fase acontece somente quando a investigação já está pronta.
+  const { data: updatedRoom, error } = await sb
     .from("rooms")
     .update({
       round: nextRound,
       phase: "role_reveal",
       phase_ends_at: null,
+      investigation_game_id: investigationGame.id,
       log: nextLog,
     })
     .eq("code", state.roomCode)
-    .eq("phase", "day_results");
+    .eq("phase", "day_results")
+    .select("code")
+    .maybeSingle();
 
   if (error) {
     console.error("advanceToNextNight", error);
     return;
   }
 
-  const players = await fetchPlayers(state.roomCode);
-  const investigationGame = await dbCreateInvestigationGame(
-    state.roomCode,
-    nextRound,
-    players || [],
-  );
-  if (!investigationGame) {
-    console.error("advanceToNextNight: não foi possível criar a nova pista da rodada");
-    return;
-  }
-
-  await sb
-    .from("rooms")
-    .update({ investigation_game_id: investigationGame.id })
-    .eq("code", state.roomCode)
-    .eq("round", nextRound);
+  if (updatedRoom) await refresh();
 }
 
 async function submitVote(targetId) {
@@ -1610,6 +1706,14 @@ async function hostReplayRoom() {
     .eq("status", "active");
   await dbResetPlayersForLobby(state.roomCode);
 
+  // A mesma sala pode receber uma nova partida. Finalizamos as investigações
+  // anteriores para liberar novamente a combinação sala + rodada.
+  await sb
+    .from("game_investigations")
+    .update({ status: "finished", truth_revealed_at: new Date().toISOString() })
+    .eq("room_code", state.roomCode)
+    .eq("status", "active");
+
   const meta = await dbGetRoom(state.roomCode);
 
   if (meta) {
@@ -1630,6 +1734,7 @@ async function hostReplayRoom() {
   state.phaseClientDeadline = null;
   state.lastDataSignature = null;
   state.selectedTarget = null;
+  state.voteConfirmed = false;
   state.nightActionConfirmed = false;
   refresh();
 }
@@ -1646,6 +1751,7 @@ function leaveToLanding() {
     error: "",
     busy: false,
     selectedTarget: null,
+    voteConfirmed: false,
     nightActionConfirmed: false,
     lastPhaseSeen: null,
     investigationItems: [],
@@ -2116,27 +2222,56 @@ function renderNightTransition(meta) {
   return wrap;
 }
 
-function renderInvestigationItemsHtml(me) {
+function renderInvestigationItemsHtml(me, meta) {
   const items = state.investigationItems || [];
   if (!items.length) return "";
-  const title = me.role === "detetive" ? "🔎 Suas pistas" : me.role === "assassino" ? "🔪 O que você sabe sobre sua noite" : "📜 Seus fatos";
-  return `<div class="investigation-private-info"><div class="investigation-private-title">${title}</div><ol>${items.map(item => `<li>${esc(item.text_snapshot)}</li>`).join("")}</ol>${me.role === "detetive" ? `<small>Uma das pistas é verdadeira e duas são falsas. Você não sabe qual.</small>` : `<small>Essas informações fazem parte da história desta partida.</small>`}</div>`;
+
+  const isDetective = me.role === "detetive";
+  const laterRound = Number(meta?.round || 1) > 1;
+  const title = isDetective
+    ? "🔎 Suas pistas"
+    : me.role === "assassino"
+      ? "🔪 O que você sabe sobre sua noite"
+      : "📜 Seus fatos";
+
+  const lastGameItem = isDetective && laterRound
+    ? items[items.length - 1]
+    : null;
+
+  return `<div class="investigation-private-info">
+    <div class="investigation-private-title">${title}</div>
+    <ol>${items.map(item => `
+      <li class="${lastGameItem && item.id === lastGameItem.id ? "new-investigation-item" : ""}">
+        ${lastGameItem && item.id === lastGameItem.id ? '<span class="new-item-badge">NOVA</span>' : ""}
+        ${esc(item.text_snapshot)}
+      </li>`).join("")}</ol>
+    ${isDetective
+      ? laterRound
+        ? `<small class="new-clue-notice">🕵️ Uma nova pista foi adicionada nesta rodada. Ela pode ser verdadeira ou falsa.</small>`
+        : `<small>Uma das pistas é verdadeira e duas são falsas. Você não sabe qual.</small>`
+      : `<small>Essas informações fazem parte da história desta partida.</small>`}
+  </div>`;
 }
 
 function renderRoleReveal(meta, me) {
+  const firstRound = Number(meta.round || 1) === 1;
   const info = ROLE_INFO[me.role] || ROLE_INFO.cidadao;
   const image = ROLE_IMAGES[me.role] || ROLE_IMAGES.cidadao;
   const card = el(`<div class="card role-reveal-screen">
     <div class="role-reveal-visual cinematic-role-card">
       <p class="eyebrow">CIDADE DORME</p>
-      <h2 class="reveal-heading">Revelando seu papel...</h2>
-      <div class="role-image-frame cinematic-role-image"><img src="${image}" alt="${esc(info.name)}" class="role-image"></div>
-      <p class="role-you">Você é</p>
-      <h1 class="role-name role-${esc(me.role)}">${esc(info.name)}</h1>
-      <p class="tagline role-description">${esc(info.desc)}</p>
-      ${renderInvestigationItemsHtml(me)}
+      <h2 class="reveal-heading">${firstRound ? "Revelando seu papel..." : `Informações da rodada ${meta.round}`}</h2>
+      ${firstRound ? `
+        <div class="role-image-frame cinematic-role-image"><img src="${image}" alt="${esc(info.name)}" class="role-image"></div>
+        <p class="role-you">Você é</p>
+        <h1 class="role-name role-${esc(me.role)}">${esc(info.name)}</h1>
+        <p class="tagline role-description">${esc(info.desc)}</p>
+      ` : `
+        <p class="tagline role-description">Seu papel já foi revelado. Confira novamente apenas suas informações da investigação.</p>
+      `}
+      ${renderInvestigationItemsHtml(me, meta)}
       <div class="ready-status" id="ready-status">
-        ${Number(me.readyRound || 0) === Number(meta.round) ? "Você já confirmou que está pronto." : "Leia tudo com atenção antes de confirmar."}
+        ${Number(me.readyRound || 0) === Number(meta.round) ? "Você já confirmou que está pronto." : "Leia suas informações antes de confirmar."}
       </div>
       <button class="btn btn-primary" id="btn-ready" ${Number(me.readyRound || 0) === Number(meta.round) ? "disabled" : ""}>${Number(me.readyRound || 0) === Number(meta.round) ? "✓ Pronto" : "Li tudo — estou pronto"}</button>
       <p class="footnote" id="ready-count">Carregando jogadores prontos...</p>
@@ -2163,7 +2298,7 @@ function renderRoleReveal(meta, me) {
         readyButton.textContent = "✓ Pronto";
         card.querySelector("#ready-status").textContent = "Você já confirmou que está pronto.";
         await updateReadyCount();
-        refresh();
+        await refresh();
       } else {
         readyButton.disabled = false;
       }
@@ -2370,35 +2505,73 @@ function renderDiscussion(meta, me) {
 
 function renderVoting(meta, me) {
   const alivePlayers = (state.players || []).filter((p) => p.alive);
+  const confirmed = state.voteConfirmed;
+  const selectedName = state.selectedTarget === "abstain"
+    ? "Pular"
+    : alivePlayers.find(p => p.id === state.selectedTarget)?.name || null;
+
   const box = el(`<div class="card voting-card">
     <div class="discussion-head">
       ${ballotSvg(42)}
       <div><p class="eyebrow">FASE DE VOTAÇÃO</p><h2>Escolha uma pessoa para votar.</h2></div>
     </div>
     <div class="timer-panel"><span>Tempo restante</span><strong id="vote-timer">--:--</strong></div>
+    <p class="vote-instruction">Selecione sua escolha. Depois confira o ✓ e confirme o voto.</p>
     <div class="target-grid visual-target-grid" id="vote-targets"></div>
-    <button class="target-btn skip-button" id="vote-abstain">Pular</button>
-    <p class="footnote">A votação termina automaticamente quando o tempo acabar.</p>
+    <button class="target-btn skip-button ${state.selectedTarget === "abstain" ? "selected" : ""}" id="vote-abstain" ${confirmed ? "disabled" : ""}>${playerAvatar("P")}<span>Pular</span>${state.selectedTarget === "abstain" ? '<span class="selection-check">✓</span>' : ""}</button>
+    <div class="vote-confirmation-area">
+      ${selectedName ? `<div class="selected-vote-summary"><span>Escolha:</span><strong>${esc(selectedName)}</strong>${confirmed ? '<span class="confirmed-vote-check">✓ Confirmado</span>' : '<span class="pending-vote-check">✓ Selecionado</span>'}</div>` : '<div class="selected-vote-summary empty">Nenhuma escolha selecionada.</div>'}
+      <button class="btn btn-primary vote-confirm-btn" id="btn-confirm-vote" ${!state.selectedTarget || confirmed ? "disabled" : ""}>${confirmed ? "✓ Voto confirmado" : "Confirmar votação"}</button>
+    </div>
+    <p class="footnote">A votação termina automaticamente quando todos votarem ou quando o tempo acabar. Se você não confirmar, contará como Pular ao final.</p>
   </div>`);
 
   const grid = box.querySelector("#vote-targets");
   alivePlayers
     .filter((p) => p.id !== me.id)
     .forEach((t) => {
-      const b = el(`<button class="target-btn visual-target-button"></button>`);
-      b.innerHTML = `${playerAvatar(t.name)}<span>${esc(t.name)}</span>`;
+      const b = el(`<button class="target-btn visual-target-button" ${confirmed ? "disabled" : ""}></button>`);
+      b.innerHTML = `${playerAvatar(t.name)}<span>${esc(t.name)}</span>${state.selectedTarget === t.id ? '<span class="selection-check">✓</span>' : ""}`;
       if (state.selectedTarget === t.id) b.classList.add("selected");
-      b.onclick = () => submitVote(t.id);
+      b.onclick = () => {
+        if (!state.voteConfirmed) {
+          state.selectedTarget = t.id;
+          render();
+        }
+      };
       grid.appendChild(b);
     });
 
   const abstainBtn = box.querySelector("#vote-abstain");
-  abstainBtn.innerHTML = `${playerAvatar("P")}<span>Pular</span>`;
-  if (state.selectedTarget === "abstain") abstainBtn.classList.add("selected");
-  abstainBtn.onclick = () => submitVote("abstain");
+  abstainBtn.onclick = () => {
+    if (!state.voteConfirmed) {
+      state.selectedTarget = "abstain";
+      render();
+    }
+  };
+
+  const confirmBtn = box.querySelector("#btn-confirm-vote");
+  confirmBtn.onclick = confirmVote;
 
   attachCountdown(box.querySelector("#vote-timer"), meta);
   return box;
+}
+
+async function confirmVote() {
+  if (state.voteConfirmed || !state.selectedTarget) return;
+  const me = myPlayer();
+  if (!me?.alive || state.room?.phase !== "day_voting") return;
+
+  const targetId = state.selectedTarget;
+  if (targetId !== "abstain") {
+    const target = (state.players || []).find(p => p.id === targetId);
+    if (!target?.alive || target.id === me.id) return;
+  }
+
+  await dbSubmitVote(state.roomCode, state.room.round, state.playerId, targetId);
+  state.voteConfirmed = true;
+  render();
+  await resolveVotesIfEveryoneVoted();
 }
 
 function renderDayResults(meta, me) {
@@ -2415,8 +2588,24 @@ function renderDayResults(meta, me) {
 
 function renderTruthHtml() {
   const truth = state.investigationCase;
-  if (!truth?.scenario) return `<div class="card truth-card"><h3>A história verdadeira</h3><p class="footnote">A história desta partida não foi carregada. Verifique se o banco de investigação foi criado corretamente.</p></div>`;
-  return `<div class="card truth-card"><p class="eyebrow">A VERDADE DO CASO</p><h2>${esc(truth.scenario.title)}</h2><p class="truth-summary">${esc(truth.scenario.truth_summary || truth.scenario.description || "")}</p><div class="truth-facts"><h3>O que realmente aconteceu</h3><ol>${truth.facts.map(f => `<li>${esc(f.text)}</li>`).join("")}</ol></div></div>`;
+  if (!truth?.scenario) {
+    return `<div class="card truth-card"><h3>A história verdadeira</h3><p class="footnote">A história desta partida não foi carregada. Verifique se o banco de investigação foi criado corretamente.</p></div>`;
+  }
+
+  // Os fatos distribuídos aos jogadores são informações privadas escritas em
+  // primeira pessoa ("Você..."). Eles não devem aparecer no final da partida,
+  // porque esta tela é pública. A verdade oficial vem do truth_summary do caso,
+  // que descreve o que o assassino realmente fez de forma objetiva.
+  const summary = truth.scenario.truth_summary || truth.scenario.description || "";
+
+  return `<div class="card truth-card">
+    <p class="eyebrow">A VERDADE DO CASO</p>
+    <h2>${esc(truth.scenario.title)}</h2>
+    <div class="truth-facts">
+      <h3>O que realmente aconteceu</h3>
+      <p class="truth-summary">${esc(summary)}</p>
+    </div>
+  </div>`;
 }
 
 function renderGameOver() {
