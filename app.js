@@ -1069,9 +1069,12 @@ async function refreshOnce() {
     playDeathSequenceSound();
 
     window.setTimeout(() => {
+      // A vítima permanece exclusivamente na tela preta durante toda a
+      // revelação de 10s. Ao terminar, atualizamos a fase do servidor e
+      // entramos diretamente na discussão.
       state.deathSequenceActive = false;
-      render();
-    }, 5200);
+      refresh();
+    }, 10000);
   }
 
   state.room = meta;
@@ -1326,10 +1329,11 @@ function startPhaseTimer(meta) {
 
     state.phaseTimerHandle = null;
 
-    // Pequena pausa depois do 00:00 para a mudança de tela não parecer
-    // instantânea/cortada. O relógio já chegou a zero, mas a próxima ação
-    // só acontece após este intervalo curto.
-    await new Promise((resolve) => setTimeout(resolve, 850));
+    // A revelação de morte termina exatamente aos 10s. As demais fases
+    // mantêm a pequena pausa para a troca não parecer cortada.
+    if (current.phase !== "day_reveal") {
+      await new Promise((resolve) => setTimeout(resolve, 850));
+    }
 
     const latest = await dbGetRoom(state.roomCode);
     if (!latest || latest.phase !== current.phase) {
@@ -2086,6 +2090,11 @@ async function hostReplayRoom() {
   state.busy = true;
 
   const previousMeta = await dbGetRoom(state.roomCode);
+  const previousPlayers = (await fetchPlayers(state.roomCode)) || [];
+
+  // A reinicialização reaproveita exatamente os mesmos jogadores da sala.
+  // Guardamos a lista antes do reset e a conferimos depois para evitar que
+  // uma nova partida seja criada sem algum participante da anterior.
   // Encerra todos os registros de investigação ativos desta partida.
   // Assim a próxima partida pode sortear uma nova história normalmente.
   await sb
@@ -2112,6 +2121,31 @@ async function hostReplayRoom() {
       "Não foi possível preparar os jogadores para uma nova partida.";
     render();
     return;
+  }
+
+  // Reforça a permanência dos participantes. Se alguma linha não tiver sido
+  // afetada pelo UPDATE (por exemplo, por uma inconsistência momentânea),
+  // ela é recolocada na sala sem alterar o id/nome do jogador.
+  const playersAfterReset = (await fetchPlayers(state.roomCode)) || [];
+  const existingIds = new Set(playersAfterReset.map((p) => p.id));
+  const missingPlayers = previousPlayers.filter((p) => !existingIds.has(p.id));
+  if (missingPlayers.length) {
+    await Promise.all(
+      missingPlayers.map((p) =>
+        dbUpsertPlayer(state.roomCode, {
+          ...p,
+          alive: true,
+          role: null,
+          readyRound: 0,
+          traitLocal: null,
+          traitObjeto: null,
+          traitVestimenta: null,
+          traitIntencao: null,
+          traitTestemunhaAxis: null,
+          traitTestemunhaValue: null,
+        }),
+      ),
+    );
   }
 
   const meta = await dbGetRoom(state.roomCode);
@@ -3035,17 +3069,6 @@ function renderGhostIndicator() {
   </div>`);
 }
 
-function renderSpectator(meta, me) {
-  return el(`<div class="card death-banner death-screen-cinematic">
-    <div class="death-screen-glow"></div>
-    ${skullSvg(58)}
-    <h2>Você morreu</h2>
-    <p>Você foi eliminado(a) da partida.</p>
-    <p style="margin-top:8px;color:var(--ui-muted);">Seu papel era <strong>${esc(ROLE_INFO[me.role]?.name || "não identificado")}</strong>.</p>
-    <p style="margin-top:8px;color:var(--ui-muted);">Acompanhe a partida como um fantasma até o fim.</p>
-  </div>`);
-}
-
 function renderSpectatorNight(meta, me) {
   const players = (state.players || []).filter((p) => p.alive);
   const actions = state.spectatorNightActions || [];
@@ -3381,10 +3404,10 @@ function renderVoting(meta, me, spectator = false) {
     ${spectator ? `<p class="vote-instruction">Os bonecos mostram quantas pessoas já votaram em cada opção.</p>` : `<p class="vote-instruction">Selecione sua escolha e confirme o voto.</p>`}
     <div class="target-grid visual-target-grid" id="vote-targets"></div>
     <div class="vote-skip-row">
-      <div class="target-btn skip-button ${state.selectedTarget === "abstain" ? "selected" : ""} ${spectator ? "spectator-option" : ""}">
+      <button type="button" class="target-btn skip-button ${state.selectedTarget === "abstain" ? "selected" : ""} ${spectator ? "spectator-option" : ""}" ${spectator || confirmed ? "disabled" : ""}>
         <span>Pular</span>${voteBubblesHtml(getVoteCount("abstain"))}
         ${!spectator && state.selectedTarget === "abstain" ? '<span class="selection-check">✓</span>' : ""}
-      </div>
+      </button>
     </div>
     ${
       spectator
@@ -3398,6 +3421,14 @@ function renderVoting(meta, me, spectator = false) {
   </div>`);
 
   const grid = box.querySelector("#vote-targets");
+  const skipButton = box.querySelector(".skip-button");
+  if (skipButton && !spectator) {
+    skipButton.onclick = () => {
+      if (state.voteConfirmed) return;
+      state.selectedTarget = "abstain";
+      render();
+    };
+  }
   alivePlayers.forEach((t) => {
     const isMe = t.id === me.id;
     if (!spectator && isMe) return;
@@ -4088,13 +4119,14 @@ function trophySvg(size = 64) {
     .ghost-phase-note{margin:0 0 14px;padding:10px 12px;border:1px solid rgba(180,194,220,.2);border-radius:10px;background:rgba(255,255,255,.018);color:#aab6ca;text-align:center;font-size:.86rem;}
     .spectator-night-card{overflow:visible;}
     .spectator-action-list{display:grid;gap:8px;margin-top:18px;}
-    .spectator-action-row{display:grid;grid-template-columns:34px minmax(120px,180px) 10px minmax(0,1fr);align-items:center;gap:10px;padding:11px 12px;border:1px solid var(--ui-line);border-radius:12px;background:rgba(255,255,255,.018);}
+    .spectator-action-row{display:grid;grid-template-columns:34px minmax(120px,180px) minmax(0,1fr) minmax(0,auto) 12px;align-items:center;gap:10px;padding:11px 12px;border:1px solid var(--ui-line);border-radius:12px;background:rgba(255,255,255,.018);}
     .spectator-action-main{display:grid;gap:2px;min-width:0;}
     .spectator-action-main strong{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
     .spectator-action-main span{font-size:.75rem;color:var(--ui-muted);}
-    .spectator-action-dot{width:8px;height:8px;border-radius:50%;background:#7d8ba3;box-shadow:0 0 0 4px rgba(125,139,163,.08);}
+    .spectator-action-text{grid-column:4;color:#d8e1f2;font-size:.88rem;text-align:right;justify-self:end;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+    .spectator-action-dot{grid-column:5;width:8px;height:8px;border-radius:50%;background:#7d8ba3;box-shadow:0 0 0 4px rgba(125,139,163,.08);justify-self:end;}
     .spectator-action-row.done .spectator-action-dot{background:#f2c078;box-shadow:0 0 0 4px rgba(242,192,120,.08);}
-    .spectator-action-text{color:#d8e1f2;font-size:.88rem;}
+    .spectator-action-row > .player-avatar{grid-column:1;}
     .vote-bubbles{margin-left:auto;display:flex;align-items:center;justify-content:flex-end;gap:1px;white-space:nowrap;font-size:1rem;letter-spacing:-.2em;min-width:24px;}
     .vote-bubbles.empty{min-width:24px;}
     .vote-skip-row{margin-top:10px;}
@@ -4125,9 +4157,10 @@ function trophySvg(size = 64) {
       .settings-modal-actions{flex-direction:column-reverse;}
       .settings-modal-actions .btn{width:100%;}
       .lobby-settings-summary{align-items:flex-start;flex-direction:column;}
-      .spectator-action-row{grid-template-columns:34px 1fr;gap:8px;}
-      .spectator-action-dot{display:none;}
-      .spectator-action-text{grid-column:2;}
+      .spectator-action-row{grid-template-columns:34px 1fr 1fr 12px;gap:8px;}
+      .spectator-action-main{grid-column:2;}
+      .spectator-action-text{grid-column:3;text-align:right;justify-self:end;}
+      .spectator-action-dot{grid-column:4;display:block;}
     }
 
     @media(max-width:640px){
@@ -4306,12 +4339,12 @@ document.addEventListener("pointerdown", unlockAudio, { passive: true });
     .death-sequence-eyelid-top {
       top: 0;
       transform: translateY(-100%);
-      animation: deathEyeTop 5.2s cubic-bezier(.7, 0, .2, 1) both;
+      animation: deathEyeTop 10s cubic-bezier(.7, 0, .2, 1) both;
     }
     .death-sequence-eyelid-bottom {
       bottom: 0;
       transform: translateY(100%);
-      animation: deathEyeBottom 5.2s cubic-bezier(.7, 0, .2, 1) both;
+      animation: deathEyeBottom 10s cubic-bezier(.7, 0, .2, 1) both;
     }
     .death-sequence-message {
       position: relative;
@@ -4319,7 +4352,7 @@ document.addEventListener("pointerdown", unlockAudio, { passive: true });
       width: min(90vw, 520px);
       text-align: center;
       opacity: 0;
-      animation: deathMessage 5.2s ease both;
+      animation: deathMessage 10s ease both;
       padding: 24px;
       box-sizing: border-box;
     }
