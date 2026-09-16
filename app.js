@@ -44,6 +44,17 @@ function metaFromRow(row) {
     revealedTraits: Array.isArray(row.revealed_traits)
       ? row.revealed_traits
       : [],
+    roleCounts: {
+      assassino: Math.max(1, Number(row.assassin_count) || 1),
+      detetive:
+        row.detective_count == null
+          ? 1
+          : Math.max(0, Number(row.detective_count) || 0),
+      anjo:
+        row.angel_count == null
+          ? 1
+          : Math.max(0, Number(row.angel_count) || 0),
+    },
   };
 }
 function rowFromMeta(code, meta) {
@@ -72,6 +83,9 @@ function rowFromMeta(code, meta) {
     revealed_traits: Array.isArray(meta.revealedTraits)
       ? meta.revealedTraits
       : [],
+    assassin_count: Math.max(1, Number(meta.roleCounts?.assassino) || 1),
+    detective_count: Math.max(0, Number(meta.roleCounts?.detetive) || 0),
+    angel_count: Math.max(0, Number(meta.roleCounts?.anjo) || 0),
   };
 }
 async function dbGetRoom(code) {
@@ -670,13 +684,44 @@ function shuffle(arr) {
   }
   return a;
 }
-function computeRoleCounts(n) {
+function computeRoleCounts(n, configured = null) {
   if (n < 4) return { assassino: 0, detetive: 0, anjo: 0, cidadao: n };
 
-  // A partir de 4 jogadores existem obrigatoriamente:
-  // 1 Assassino + 1 Detetive + 1 Anjo + 1 Cidadão.
-  // Acima de 4, todos os demais são cidadãos comuns.
-  return { assassino: 1, detetive: 1, anjo: 1, cidadao: n - 3 };
+  const assassino = Math.max(1, Number(configured?.assassino) || 1);
+  const detetive = Math.max(0, Number(configured?.detetive) || 0);
+  const anjo = Math.max(0, Number(configured?.anjo) || 0);
+  const special = assassino + detetive + anjo;
+
+  return {
+    assassino,
+    detetive,
+    anjo,
+    cidadao: Math.max(0, n - special),
+  };
+}
+
+function normalizeRoleCountsForPlayers(playerCount, configured) {
+  if (playerCount < 4) return { assassino: 1, detetive: 1, anjo: 1 };
+
+  let assassino = Math.max(1, Math.floor(Number(configured?.assassino) || 1));
+  let detetive = Math.max(0, Math.floor(Number(configured?.detetive) || 0));
+  let anjo = Math.max(0, Math.floor(Number(configured?.anjo) || 0));
+
+  // Sempre preserva pelo menos um lugar para não-especiais.
+  const maxSpecial = Math.max(1, playerCount - 1);
+  if (assassino > maxSpecial) assassino = maxSpecial;
+  if (assassino + detetive + anjo > maxSpecial) {
+    let remaining = maxSpecial - assassino;
+    detetive = Math.min(detetive, remaining);
+    remaining -= detetive;
+    anjo = Math.min(anjo, remaining);
+  }
+
+  return { assassino, detetive, anjo };
+}
+
+function roleCountLabel(counts) {
+  return `${counts.assassino} assassino(s), ${counts.detetive} detetive(s), ${counts.anjo} anjo(s) e ${counts.cidadao} cidadão(s)`;
 }
 const ROLE_INFO = {
   assassino: {
@@ -704,7 +749,7 @@ const ROLE_IMAGES = {
 };
 
 const ROLE_REVEAL_SECONDS = 5;
-const DAY_REVEAL_SECONDS = 7;
+const DAY_REVEAL_SECONDS = 10;
 const DAY_RESULTS_SECONDS = 7;
 const NIGHT_TRANSITION_SECONDS = 11;
 const AUDIO_ASSETS = {
@@ -879,6 +924,7 @@ async function createRoom(name) {
     cluesPerRound: 1,
     revealOrder: [],
     revealedTraits: [],
+    roleCounts: { assassino: 1, detetive: 1, anjo: 1 },
   };
   await dbCreateRoom(code, meta);
   await dbUpsertPlayer(code, {
@@ -900,6 +946,7 @@ async function updateRoomSettings(
   scenarioKey,
   traitCategories,
   cluesPerRound,
+  roleCounts,
 ) {
   if (!state.isHost || !state.roomCode || state.room?.status !== "lobby")
     return;
@@ -913,6 +960,20 @@ async function updateRoomSettings(
     1,
     Math.min(Number(cluesPerRound) || 1, getActiveAxes(meta).length),
   );
+
+  const players = (await fetchPlayers(state.roomCode)) || [];
+  if (players.length >= 4) {
+    const normalized = normalizeRoleCountsForPlayers(players.length, roleCounts);
+    const specialTotal =
+      normalized.assassino + normalized.detetive + normalized.anjo;
+    if (specialTotal > players.length - 1) {
+      state.error =
+        "A configuração de papéis precisa deixar pelo menos 1 jogador para cidadão.";
+      return false;
+    }
+    meta.roleCounts = normalized;
+  }
+
   await dbUpdateRoom(state.roomCode, meta);
   state.room = meta;
   return true;
@@ -1126,6 +1187,7 @@ async function refreshOnce() {
     scenarioKey: meta.scenarioKey,
     traitCategories: meta.traitCategories,
     cluesPerRound: meta.cluesPerRound,
+    roleCounts: meta.roleCounts,
     revealedTraits: meta.revealedTraits,
     votes: (state.currentVotes || []).map((v) => ({
       voterId: v.voterId,
@@ -1532,13 +1594,24 @@ async function hostStartGame() {
     return;
   }
 
-  // Com 4 jogadores, os 4 papéis existem obrigatoriamente.
-  // Acima de 4, os jogadores extras são cidadãos.
+  // A configuração dos papéis é feita pelo host no lobby.
+  // A partir de 4 jogadores, ela define quantos assassinos, detetives e anjos
+  // existirão; os lugares restantes são preenchidos por cidadãos.
+  const roomSettings = await dbGetRoom(state.roomCode);
+  if (!roomSettings || roomSettings.status !== "lobby") {
+    state.busy = false;
+    return;
+  }
+  const roleCounts = normalizeRoleCountsForPlayers(
+    players.length,
+    roomSettings.roleCounts,
+  );
+  const counts = computeRoleCounts(players.length, roleCounts);
   const pool = shuffle([
-    "assassino",
-    "detetive",
-    "anjo",
-    ...Array(Math.max(1, players.length - 3)).fill("cidadao"),
+    ...Array(counts.assassino).fill("assassino"),
+    ...Array(counts.detetive).fill("detetive"),
+    ...Array(counts.anjo).fill("anjo"),
+    ...Array(counts.cidadao).fill("cidadao"),
   ]);
   const shuffledPlayers = shuffle(players);
 
@@ -1560,13 +1633,14 @@ async function hostStartGame() {
     ),
   );
 
-  const meta = await dbGetRoom(state.roomCode);
+  const meta = roomSettings;
 
   if (!meta || meta.status !== "lobby") {
     state.busy = false;
     return;
   }
 
+  meta.roleCounts = roleCounts;
   meta.status = "active";
   meta.phase = "role_reveal";
   meta.round = (meta.round || 0) + 1;
@@ -2308,6 +2382,8 @@ function renderLobby() {
     Number(state.room?.cluesPerRound) || 1,
     Math.max(1, activeAxes.length),
   );
+  const roleCounts = computeRoleCounts(players.length, state.room?.roleCounts);
+  const roleConfigEnabled = players.length >= 4;
 
   const wrap = el(`<div class="wrap lobby-screen">
     <div class="top-bar">
@@ -2330,8 +2406,8 @@ function renderLobby() {
 
     ${
       players.length < 4
-        ? `<p class="status-line">São necessários pelo menos 4 jogadores para começar.</p>`
-        : `<p class="tagline lobby-role-summary">Com ${players.length} jogadores: 1 assassino, 1 detetive, 1 anjo e ${Math.max(1, players.length - 3)} cidadão(s).</p>`
+        ? `<p class="status-line">São necessários pelo menos 4 jogadores para começar e configurar os papéis.</p>`
+        : `<p class="tagline lobby-role-summary">Com ${players.length} jogadores: ${esc(roleCountLabel(roleCounts))}.</p>`
     }
 
 <div class="card lobby-settings-summary"> 
@@ -2358,6 +2434,10 @@ function renderLobby() {
       <span>${clueValue} pista(s) por rodada</span>
     </div>
 
+    <div class="lobby-settings-role-summary">
+      Papéis: ${esc(roleCountLabel(roleCounts))}
+    </div>
+
     <div class="lobby-settings-categories">
       Traços a serem revelados: ${categories
         .map(
@@ -2380,6 +2460,39 @@ function renderLobby() {
                   <h2 id="settings-title">Configurações da partida</h2>
                 </div>
                 <button class="settings-close" id="btn-settings-close" aria-label="Fechar">×</button>
+              </div>
+
+              <div class="field role-settings-field">
+                <label>Distribuição de papéis</label>
+                ${
+                  roleConfigEnabled
+                    ? `<div class="role-settings-grid">
+                        <label class="role-setting-item">
+                          <span>Assassinos</span>
+                          <select id="role-count-assassino">${Array.from({ length: players.length }, (_, i) => i + 1)
+                            .map((v) => `<option value="${v}" ${roleCounts.assassino === v ? "selected" : ""}>${v}</option>`)
+                            .join("")}</select>
+                        </label>
+                        <label class="role-setting-item">
+                          <span>Detetives</span>
+                          <select id="role-count-detetive">${Array.from({ length: players.length }, (_, i) => i)
+                            .map((v) => `<option value="${v}" ${roleCounts.detetive === v ? "selected" : ""}>${v}</option>`)
+                            .join("")}</select>
+                        </label>
+                        <label class="role-setting-item">
+                          <span>Anjos</span>
+                          <select id="role-count-anjo">${Array.from({ length: players.length }, (_, i) => i)
+                            .map((v) => `<option value="${v}" ${roleCounts.anjo === v ? "selected" : ""}>${v}</option>`)
+                            .join("")}</select>
+                        </label>
+                        <div class="role-setting-item role-setting-readonly">
+                          <span>Cidadãos</span>
+                          <strong id="role-count-cidadao">${roleCounts.cidadao}</strong>
+                        </div>
+                      </div>
+                      <p class="footnote">Disponível com 4 ou mais jogadores. Os cidadãos são calculados automaticamente. Deve sobrar pelo menos 1 cidadão.</p>`
+                    : `<div class="role-settings-disabled">Entre pelo menos 4 jogadores para configurar a quantidade de cada papel.</div>`
+                }
               </div>
 
               <div class="field">
@@ -2509,9 +2622,50 @@ function renderLobby() {
 
     const discussionSelect = wrap.querySelector("#discussion-time");
     const votingSelect = wrap.querySelector("#voting-time");
+    const assassinCountSelect = wrap.querySelector("#role-count-assassino");
+    const detectiveCountSelect = wrap.querySelector("#role-count-detetive");
+    const angelCountSelect = wrap.querySelector("#role-count-anjo");
+    const citizenCountDisplay = wrap.querySelector("#role-count-cidadao");
     const scenarioSelect = wrap.querySelector("#scenario-select");
     const clueInput = wrap.querySelector("#clues-per-round");
     const categoryChecks = [...wrap.querySelectorAll(".trait-category")];
+
+    const updateRoleCount = () => {
+      if (!assassinCountSelect || !detectiveCountSelect || !angelCountSelect) return;
+      const assassino = Math.max(1, Number(assassinCountSelect.value) || 1);
+      const detetive = Math.max(0, Number(detectiveCountSelect.value) || 0);
+      const anjo = Math.max(0, Number(angelCountSelect.value) || 0);
+      const totalSpecial = assassino + detetive + anjo;
+      const maxSpecial = Math.max(1, players.length - 1);
+
+      if (totalSpecial > maxSpecial) {
+        const excess = totalSpecial - maxSpecial;
+        const values = [
+          [angelCountSelect, anjo],
+          [detectiveCountSelect, detetive],
+          [assassinCountSelect, assassino - 1],
+        ];
+        let left = excess;
+        for (const [select, value] of values) {
+          if (!left) break;
+          const min = select === assassinCountSelect ? 1 : 0;
+          const reduction = Math.min(left, Math.max(0, value - min));
+          select.value = String(value - reduction);
+          left -= reduction;
+        }
+      }
+
+      const currentTotal =
+        Number(assassinCountSelect.value) +
+        Number(detectiveCountSelect.value) +
+        Number(angelCountSelect.value);
+      if (citizenCountDisplay) citizenCountDisplay.textContent = String(Math.max(0, players.length - currentTotal));
+    };
+
+    [assassinCountSelect, detectiveCountSelect, angelCountSelect].forEach((input) => {
+      if (input) input.onchange = updateRoleCount;
+    });
+    updateRoleCount();
 
     const updateClueLimit = () => {
       const axesCount = categoryChecks.filter(
@@ -2547,12 +2701,18 @@ function renderLobby() {
       const selected = categoryChecks
         .filter((c) => c.checked)
         .map((c) => c.value);
+      const roleCountsToSave = {
+        assassino: assassinCountSelect ? Number(assassinCountSelect.value) : roleCounts.assassino,
+        detetive: detectiveCountSelect ? Number(detectiveCountSelect.value) : roleCounts.detetive,
+        anjo: angelCountSelect ? Number(angelCountSelect.value) : roleCounts.anjo,
+      };
       const ok = await updateRoomSettings(
         discussionSelect.value,
         votingSelect.value,
         scenarioSelect.value,
         selected,
         clueInput.value,
+        roleCountsToSave,
       );
       if (ok !== false) {
         state.showLobbySettings = false;
@@ -3222,11 +3382,7 @@ function renderVoting(meta, me, spectator = false) {
     <div class="target-grid visual-target-grid" id="vote-targets"></div>
     <div class="vote-skip-row">
       <div class="target-btn skip-button ${state.selectedTarget === "abstain" ? "selected" : ""} ${spectator ? "spectator-option" : ""}">
-        <span class="target-identity">
-          ${playerAvatar("P")}
-          <span>Pular</span>
-        </span>
-        ${voteBubblesHtml(getVoteCount("abstain"))}
+        <span>Pular</span>${voteBubblesHtml(getVoteCount("abstain"))}
         ${!spectator && state.selectedTarget === "abstain" ? '<span class="selection-check">✓</span>' : ""}
       </div>
     </div>
@@ -3250,15 +3406,7 @@ function renderVoting(meta, me, spectator = false) {
     const b = el(
       `<button class="target-btn visual-target-button ${spectator ? "spectator-option" : ""}" ${spectator || confirmed ? "disabled" : ""}></button>`,
     );
-    b.innerHTML = `
-      <span class="target-identity">
-        ${playerAvatar(t.name)}
-        <span>${esc(t.name)}</span>
-      </span>
-      ${voteBubblesHtml(count)}
-      ${!spectator && state.selectedTarget === t.id
-        ? '<span class="selection-check">✓</span>'
-        : ""}`;
+    b.innerHTML = `<span>${esc(t.name)}</span>${voteBubblesHtml(count)}${!spectator && state.selectedTarget === t.id ? '<span class="selection-check">✓</span>' : ""}`;
     if (!spectator && state.selectedTarget === t.id)
       b.classList.add("selected");
 
@@ -3953,8 +4101,8 @@ function trophySvg(size = 64) {
     .vote-skip-row .skip-button{margin-top:0 !important;}
     .spectator-option{cursor:default !important;}
     .day-reveal-screen{position:relative;overflow:hidden;}
-    .death-awakening{animation:deathAwakening 7s cubic-bezier(.2,.6,.2,1) both;}
-    .death-awakening .event-icon,.death-awakening .eyebrow,.death-awakening h2,.death-awakening .tagline,.death-awakening .phase-mini-timer{animation:deathContentIn 6.4s ease both;}
+    .death-awakening{animation:deathAwakening 10s cubic-bezier(.2,.6,.2,1) both;}
+    .death-awakening .event-icon,.death-awakening .eyebrow,.death-awakening h2,.death-awakening .tagline,.death-awakening .phase-mini-timer{animation:deathContentIn 9.2s ease both;}
     @keyframes deathAwakening{
       0%{opacity:0;transform:scale(.985);filter:blur(7px);}
       32%{opacity:.18;filter:blur(5px);}
