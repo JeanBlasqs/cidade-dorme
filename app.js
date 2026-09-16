@@ -227,6 +227,23 @@ async function dbGetNightActions(code, round, role) {
     targetAxis: r.target_axis || null,
   }));
 }
+async function dbGetAllNightActions(code, round) {
+  const { data, error } = await sb
+    .from("night_actions")
+    .select("player_id,target_id,target_axis,role")
+    .eq("room_code", code)
+    .eq("round", round);
+  if (error) {
+    console.error("dbGetAllNightActions", error);
+    return [];
+  }
+  return (data || []).map((r) => ({
+    playerId: r.player_id,
+    targetId: r.target_id,
+    targetAxis: r.target_axis || null,
+    role: r.role,
+  }));
+}
 async function dbSubmitVote(code, round, voterId, targetId) {
   const { error } = await sb.from("votes").upsert(
     {
@@ -297,7 +314,7 @@ const SCENARIO_PRESETS = {
     name: "Prefeitura",
     description: "Prédios públicos, arquivos e a praça central.",
     local: ["escritório", "salão de reuniões", "banheiro"],
-    objeto: ["tesoura", "chave inglesa", "maleta"],
+    objeto: ["tesoura", "chave inglesa", "pasta com documentos"],
     vestimenta: ["terno escuro", "camisa social clara", "casaco"],
   },
   cassino: {
@@ -311,14 +328,14 @@ const SCENARIO_PRESETS = {
     name: "Praia",
     description: "Calçadão, quiosques e areia à noite.",
     local: ["quiosque", "estacionamento", "vestiário"],
-    objeto: ["canivete", "balde", "garrafa de vidro"],
+    objeto: ["canivete", "tesoura", "garrafa de vidro"],
     vestimenta: ["camiseta clara", "regata escura", "jaqueta"],
   },
   festa: {
     name: "Festa",
     description: "Música, salão e áreas de serviço movimentadas.",
     local: ["salão da festa", "cozinha", "área externa"],
-    objeto: ["faca de cozinha", "saca-rolhas", "palito de dente"],
+    objeto: ["faca de cozinha", "saca-rolhas", "tesoura"],
     vestimenta: ["camisa preta", "camisa branca", "jaqueta jeans"],
   },
 };
@@ -346,7 +363,24 @@ function getActiveAxes(meta) {
 
 function traitValue(player, axis) {
   if (!player) return null;
+  if (axis === "testemunha") {
+    if (!player.traitTestemunhaAxis || !player.traitTestemunhaValue)
+      return null;
+    const label =
+      TRAIT_CATEGORIES[player.traitTestemunhaAxis]?.description ||
+      player.traitTestemunhaAxis;
+    return `${label}: ${player.traitTestemunhaValue}`;
+  }
   return player[`trait${axis.charAt(0).toUpperCase()}${axis.slice(1)}`] || null;
+}
+
+function getInvestigationAxes(meta) {
+  return normalizeTraitCategories(meta?.traitCategories).filter(
+    (axis) =>
+      DEDUCIBLE_AXES.includes(axis) ||
+      axis === "intencao" ||
+      axis === "testemunha",
+  );
 }
 
 function traitField(axis) {
@@ -498,12 +532,22 @@ async function dbRevealNextTraits(code, meta, players) {
   const assassin = (players || []).find(
     (p) => p.alive && p.role === "assassino",
   );
-  if (!assassin) return meta;
+  if (!assassin || !axes.length) return meta;
+
+  // Rodada 1 não revela pista. A partir da rodada 2, cada rodada acrescenta
+  // apenas a quantidade configurada em "Traços revelados por rodada".
+  const cluesPerRound = Math.max(1, Number(meta.cluesPerRound) || 1);
+  const targetTotal = Math.min(
+    Math.max(0, (Number(meta.round) || 1) - 1) * cluesPerRound,
+    axes.length,
+  );
+  if (revealed.length >= targetTotal) return meta;
 
   let added = 0;
-  const max = Math.min(Number(meta.cluesPerRound) || 1, axes.length);
+  const max = targetTotal - revealed.length;
   const queue = order.slice();
   const fallback = [];
+
   while (queue.length && added < max) {
     const axis = queue.shift();
     if (revealedAxes.has(axis)) continue;
@@ -511,14 +555,17 @@ async function dbRevealNextTraits(code, meta, players) {
     const aliveCount = (players || []).filter(
       (p) => p.alive && traitValue(p, axis) === value,
     ).length;
+
     if (aliveCount < 3) {
       fallback.push(axis);
       continue;
     }
+
     revealed.push({ axis, value });
     revealedAxes.add(axis);
     added++;
   }
+
   while (added < max && fallback.length) {
     const axis = fallback.shift();
     if (revealedAxes.has(axis)) continue;
@@ -526,21 +573,23 @@ async function dbRevealNextTraits(code, meta, players) {
     revealedAxes.add(axis);
     added++;
   }
+
   if (!added) return meta;
 
   const log = Array.isArray(meta.log) ? meta.log.slice() : [];
-  const addedNow = revealed.slice(-added);
-  addedNow.forEach(({ axis, value }) => {
+  revealed.slice(-added).forEach(({ axis, value }) => {
     const label = TRAIT_CATEGORIES[axis]?.label || axis;
     const line = `Descobriu-se que o assassino estava com ${label.toLowerCase()}: ${value}.`;
     if (!log.includes(line)) log.push(line);
   });
+
   const nextMeta = {
     ...meta,
     revealOrder: queue.concat(fallback),
     revealedTraits: revealed,
     log,
   };
+
   const { error } = await sb
     .from("rooms")
     .update({
@@ -550,6 +599,7 @@ async function dbRevealNextTraits(code, meta, players) {
     })
     .eq("code", code)
     .eq("phase", "role_reveal");
+
   if (error) {
     console.error("dbRevealNextTraits", error);
     return meta;
@@ -660,6 +710,7 @@ const NIGHT_TRANSITION_SECONDS = 11;
 const AUDIO_ASSETS = {
   bell: "assets/audio/church-bell.mp3",
   owl: "assets/audio/owl.mp3",
+  death: "assets/audio/heart-stop.mp3",
 };
 
 const SESSION_KEY = "cidade-dorme-session-v1";
@@ -782,6 +833,10 @@ const state = {
   lastRenderedPhase: null,
   chat: [],
   showInvestigation: false,
+  showLobbySettings: false,
+  currentVotes: [],
+  spectatorNightActions: [],
+  lastDeathSoundRound: null,
   nightRoleDone: { assassino: false, detetive: false, anjo: false },
   refreshInFlight: false,
   refreshQueued: false,
@@ -855,6 +910,7 @@ async function updateRoomSettings(
   );
   await dbUpdateRoom(state.roomCode, meta);
   state.room = meta;
+  return true;
 }
 
 async function joinRoom(code, name) {
@@ -943,9 +999,19 @@ async function refreshOnce() {
         )
       : [];
     state.investigationCase = null;
+    state.currentVotes =
+      meta.phase === "day_voting"
+        ? await dbGetVotes(state.roomCode, meta.round)
+        : [];
+    state.spectatorNightActions =
+      meta.phase === "night" && me && !me.alive
+        ? await dbGetAllNightActions(state.roomCode, meta.round)
+        : [];
   } else {
     state.investigationItems = [];
     state.investigationCase = null;
+    state.currentVotes = [];
+    state.spectatorNightActions = [];
   }
 
   if (meta.status === "lobby" && state.screen === "game") {
@@ -1030,6 +1096,16 @@ async function refreshOnce() {
     traitCategories: meta.traitCategories,
     cluesPerRound: meta.cluesPerRound,
     revealedTraits: meta.revealedTraits,
+    votes: (state.currentVotes || []).map((v) => ({
+      voterId: v.voterId,
+      targetId: v.targetId,
+    })),
+    nightActions: (state.spectatorNightActions || []).map((a) => ({
+      playerId: a.playerId,
+      targetId: a.targetId,
+      targetAxis: a.targetAxis,
+      role: a.role,
+    })),
     players: players.map((p) => ({
       id: p.id,
       name: p.name,
@@ -1978,6 +2054,9 @@ function leaveToLanding() {
     lastPhaseSeen: null,
     investigationItems: [],
     investigationCase: null,
+    currentVotes: [],
+    spectatorNightActions: [],
+    showLobbySettings: false,
   });
   render();
 }
@@ -2182,11 +2261,19 @@ function renderLobby() {
   const canStart = players.length >= 4 && state.isHost && !state.busy;
   const discussionSeconds = state.room?.discussionSeconds || 60;
   const votingSeconds = state.room?.votingSeconds || 45;
+  const categories = normalizeTraitCategories(state.room?.traitCategories);
+  const activeAxes = categories.filter((x) => DEDUCIBLE_AXES.includes(x));
+  const clueValue = Math.min(
+    Number(state.room?.cluesPerRound) || 1,
+    Math.max(1, activeAxes.length),
+  );
 
   const wrap = el(`<div class="wrap lobby-screen">
     <div class="top-bar">
       <span class="room-pill">Sala ${esc(state.roomCode || "")}</span>
-      <button class="link-btn" id="btn-leave">Sair</button>
+      <div class="lobby-top-actions">
+        <button class="link-btn" id="btn-leave">Sair</button>
+      </div>
     </div>
 
     <div class="room-code-card">
@@ -2206,66 +2293,122 @@ function renderLobby() {
         : `<p class="tagline lobby-role-summary">Com ${players.length} jogadores: 1 assassino, 1 detetive, 1 anjo e ${Math.max(1, players.length - 3)} cidadão(s).</p>`
     }
 
-    <div class="card lobby-settings" style="margin-top:18px;">
-      <h3>Configurações da sala</h3>
-      <p class="tagline" style="margin-top:6px;">O anfitrião pode alterar os tempos enquanto a sala estiver no lobby.</p>
+<div class="card lobby-settings-summary"> 
+  <div class="lobby-settings-content">
+    <div class="lobby-settings-header">
+      <p class="eyebrow">CONFIGURAÇÕES</p>
 
-      <div class="field" style="margin-top:14px;">
-        <label for="discussion-time">Tempo de discussão</label>
-        <select id="discussion-time" ${state.isHost ? "" : "disabled"}>
-          ${[15, 30, 45, 60, 90, 120, 180]
-            .map(
-              (v) =>
-                `<option value="${v}" ${Number(discussionSeconds) === v ? "selected" : ""}>${v} segundos</option>`,
-            )
-            .join("")}
-        </select>
-      </div>
-
-      <div class="field">
-        <label for="voting-time">Tempo de votação</label>
-        <select id="voting-time" ${state.isHost ? "" : "disabled"}>
-          ${[15, 30, 45, 60, 90, 120]
-            .map(
-              (v) =>
-                `<option value="${v}" ${Number(votingSeconds) === v ? "selected" : ""}>${v} segundos</option>`,
-            )
-            .join("")}
-        </select>
-      </div>
-      <div class="field">
-        <label for="scenario-select">Cenário</label>
-        <select id="scenario-select" ${state.isHost ? "" : "disabled"}>
-          ${Object.entries(SCENARIO_PRESETS)
-            .map(
-              ([key, s]) =>
-                `<option value="${key}" ${state.room?.scenarioKey === key ? "selected" : ""}>${esc(s.name)}</option>`,
-            )
-            .join("")}
-        </select>
-        <p class="footnote">${esc(getScenarioPreset(state.room?.scenarioKey).description)}</p>
-      </div>
-
-      <div class="field">
-        <label>Informações ativas</label>
-        <div style="display:grid;gap:8px;margin-top:8px;">
-          ${Object.entries(TRAIT_CATEGORIES)
-            .map(
-              ([key, info]) =>
-                `<label style="display:flex;gap:8px;align-items:center;"><input type="checkbox" class="trait-category" value="${key}" ${normalizeTraitCategories(state.room?.traitCategories).includes(key) ? "checked" : ""} ${state.isHost ? "" : "disabled"}> <span>${esc(info.label)}</span></label>`,
-            )
-            .join("")}
-        </div>
-        <p class="footnote">Local, objeto e vestimenta são os eixos dedutíveis. Testemunha torna a informação mais forte; intenção é apenas narrativa.</p>
-      </div>
-
-      <div class="field">
-        <label for="clues-per-round">Traços revelados por rodada</label>
-        <input id="clues-per-round" type="number" min="1" max="${Math.max(1, getActiveAxes(state.room).length)}" value="${Math.min(Number(state.room?.cluesPerRound) || 1, Math.max(1, getActiveAxes(state.room).length))}" ${state.isHost ? "" : "disabled"}>
-      </div>
-
-      <p class="footnote">${state.isHost ? "Você pode mudar essas opções a qualquer momento antes de iniciar." : "Somente o anfitrião pode alterar as configurações."}</p>
+      ${
+        state.isHost
+          ? `
+        <button class="btn btn-ghost settings-summary-btn" id="btn-settings-summary">
+          Editar
+        </button>
+      `
+          : ""
+      }
     </div>
+
+    <h3>${esc(getScenarioPreset(state.room?.scenarioKey).name)}</h3>
+
+    <div class="lobby-settings-info">
+      <span>Discussão: ${formatSeconds(discussionSeconds)}</span>
+      <span>Votação: ${formatSeconds(votingSeconds)}</span>
+      <span>${clueValue} pista(s) por rodada</span>
+    </div>
+
+    <div class="lobby-settings-categories">
+      Traços a serem revelados: ${categories
+        .map(
+          (x) => `
+        <span>${esc(TRAIT_CATEGORIES[x]?.label || x)}</span>
+      `,
+        )
+        .join("")}
+    </div>
+  </div>
+</div>
+
+    ${
+      state.showLobbySettings && state.isHost
+        ? `<div class="settings-modal-backdrop" id="settings-modal">
+            <div class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+              <div class="settings-modal-head">
+                <div>
+                  <p class="eyebrow">SALA</p>
+                  <h2 id="settings-title">Configurações da partida</h2>
+                </div>
+                <button class="settings-close" id="btn-settings-close" aria-label="Fechar">×</button>
+              </div>
+
+              <div class="field">
+                <label for="discussion-time">Tempo de discussão</label>
+                <select id="discussion-time">
+                  ${[15, 30, 45, 60, 90, 120, 180]
+                    .map(
+                      (v) =>
+                        `<option value="${v}" ${Number(discussionSeconds) === v ? "selected" : ""}>${v} segundos</option>`,
+                    )
+                    .join("")}
+                </select>
+              </div>
+
+              <div class="field">
+                <label for="voting-time">Tempo de votação</label>
+                <select id="voting-time">
+                  ${[15, 30, 45, 60, 90, 120]
+                    .map(
+                      (v) =>
+                        `<option value="${v}" ${Number(votingSeconds) === v ? "selected" : ""}>${v} segundos</option>`,
+                    )
+                    .join("")}
+                </select>
+              </div>
+
+              <div class="field">
+                <label for="scenario-select">Cenário</label>
+                <select id="scenario-select">
+                  ${Object.entries(SCENARIO_PRESETS)
+                    .map(
+                      ([key, scenario]) =>
+                        `<option value="${key}" ${state.room?.scenarioKey === key ? "selected" : ""}>${esc(scenario.name)}</option>`,
+                    )
+                    .join("")}
+                </select>
+                <p class="footnote" id="scenario-description">${esc(getScenarioPreset(state.room?.scenarioKey).description)}</p>
+              </div>
+
+              <div class="field">
+                <label>Informações ativas</label>
+                <div class="settings-check-grid">
+                  ${Object.entries(TRAIT_CATEGORIES)
+                    .map(
+                      ([key, info]) =>
+                        `<label class="settings-check">
+                      <input type="checkbox" class="trait-category" value="${key}" ${categories.includes(key) ? "checked" : ""}>
+                      <span>${esc(info.label)}</span>
+                    </label>`,
+                    )
+                    .join("")}
+                </div>
+                <p class="footnote">Local, objeto e vestimenta são dedutíveis. Intenção é narrativa. Testemunha fornece uma informação vista por outro jogador.</p>
+              </div>
+
+              <div class="field">
+                <label for="clues-per-round">Traços revelados por rodada</label>
+                <input id="clues-per-round" type="number" min="1" max="${Math.max(1, activeAxes.length)}" value="${clueValue}">
+                <p class="footnote">A primeira rodada não revela pista do assassino. A partir da segunda, entra a quantidade definida aqui por rodada.</p>
+              </div>
+
+              <div class="settings-modal-actions">
+                <button class="btn btn-ghost" id="btn-settings-cancel">Cancelar</button>
+                <button class="btn btn-primary" id="btn-settings-save">Salvar configurações</button>
+              </div>
+              <p class="error-msg">${esc(state.error)}</p>
+            </div>
+          </div>`
+        : ""
+    }
 
     <hr class="divider">
 
@@ -2283,7 +2426,7 @@ function renderLobby() {
       `<div class="player-chip">
         <span class="num-badge">${i + 1}</span>
         <span>${esc(p.name)}</span>
-        </div>`,
+      </div>`,
     );
     if (p.id === state.playerId) {
       chip.appendChild(el(`<span class="you-tag">VOCÊ</span>`));
@@ -2297,53 +2440,89 @@ function renderLobby() {
   const startBtn = wrap.querySelector("#btn-start");
   if (startBtn) startBtn.onclick = hostStartGame;
 
-  const discussionSelect = wrap.querySelector("#discussion-time");
-  const votingSelect = wrap.querySelector("#voting-time");
-  const scenarioSelect = wrap.querySelector("#scenario-select");
-  const clueInput = wrap.querySelector("#clues-per-round");
-  const categoryChecks = [...wrap.querySelectorAll(".trait-category")];
-  if (state.isHost) {
-    const saveSettings = async () => {
-      if (state.busy) return;
-      const selected = categoryChecks
-        .filter((c) => c.checked)
-        .map((c) => c.value);
-      const axesCount = selected.filter((x) =>
-        DEDUCIBLE_AXES.includes(x),
+  const openSettings = () => {
+    if (!state.isHost) return;
+    state.error = "";
+    state.showLobbySettings = true;
+    render();
+  };
+
+  const settingsBtn = wrap.querySelector("#btn-settings");
+  const settingsSummaryBtn = wrap.querySelector("#btn-settings-summary");
+  if (settingsBtn) settingsBtn.onclick = openSettings;
+  if (settingsSummaryBtn) settingsSummaryBtn.onclick = openSettings;
+
+  if (state.showLobbySettings && state.isHost) {
+    const modal = wrap.querySelector("#settings-modal");
+    const closeSettings = () => {
+      state.showLobbySettings = false;
+      state.error = "";
+      render();
+    };
+
+    wrap.querySelector("#btn-settings-close").onclick = closeSettings;
+    wrap.querySelector("#btn-settings-cancel").onclick = closeSettings;
+    modal.addEventListener("click", (event) => {
+      if (event.target === modal) closeSettings();
+    });
+
+    const discussionSelect = wrap.querySelector("#discussion-time");
+    const votingSelect = wrap.querySelector("#voting-time");
+    const scenarioSelect = wrap.querySelector("#scenario-select");
+    const clueInput = wrap.querySelector("#clues-per-round");
+    const categoryChecks = [...wrap.querySelectorAll(".trait-category")];
+
+    const updateClueLimit = () => {
+      const axesCount = categoryChecks.filter(
+        (c) => c.checked && DEDUCIBLE_AXES.includes(c.value),
       ).length;
       if (!axesCount) {
         const local = categoryChecks.find((c) => c.value === "local");
         if (local) local.checked = true;
-        selected.push("local");
       }
       const max = Math.max(
         1,
-        selected.filter((x) => DEDUCIBLE_AXES.includes(x)).length,
+        categoryChecks.filter(
+          (c) => c.checked && DEDUCIBLE_AXES.includes(c.value),
+        ).length,
       );
       clueInput.max = String(max);
       if (Number(clueInput.value) > max) clueInput.value = String(max);
-      await updateRoomSettings(
+    };
+
+    categoryChecks.forEach((input) => {
+      input.onchange = updateClueLimit;
+    });
+
+    scenarioSelect.onchange = () => {
+      const scenario = getScenarioPreset(scenarioSelect.value);
+      const description = wrap.querySelector("#scenario-description");
+      if (description) description.textContent = scenario.description;
+    };
+
+    wrap.querySelector("#btn-settings-save").onclick = async () => {
+      if (state.busy) return;
+      updateClueLimit();
+      const selected = categoryChecks
+        .filter((c) => c.checked)
+        .map((c) => c.value);
+      const ok = await updateRoomSettings(
         discussionSelect.value,
         votingSelect.value,
         scenarioSelect.value,
         selected,
         clueInput.value,
       );
+      if (ok !== false) {
+        state.showLobbySettings = false;
+        state.error = "";
+        render();
+      }
     };
-    [
-      discussionSelect,
-      votingSelect,
-      scenarioSelect,
-      clueInput,
-      ...categoryChecks,
-    ].forEach((input) => {
-      if (input) input.onchange = saveSettings;
-    });
   }
 
   return wrap;
 }
-
 function myPlayer() {
   return (state.players || []).find((p) => p.id === state.playerId) || null;
 }
@@ -2359,9 +2538,11 @@ function renderGame() {
   // Assim a revelação e a chegada da noite não ficam presas dentro do layout normal.
   if (meta.phase === "role_reveal")
     return me.alive ? renderRoleReveal(meta, me) : renderSpectator(meta, me);
-  if (meta.phase === "night_transition") return renderNightTransition(meta);
+  if (meta.phase === "night_transition") return renderNightTransition(meta, me);
 
-  const wrap = el(`<div class="wrap"></div>`);
+  const wrap = el(
+    `<div class="wrap ${!me.alive ? "dead-player-view" : ""}"></div>`,
+  );
   wrap.appendChild(
     el(`<div class="top-bar">
     <span class="room-pill">Sala ${esc(state.roomCode)} · Rodada ${meta.round}</span>
@@ -2386,7 +2567,18 @@ function renderGame() {
   }
 
   if (!me.alive) {
-    wrap.appendChild(renderSpectator(meta, me));
+    wrap.appendChild(renderGhostIndicator());
+    if (meta.phase === "night") {
+      wrap.appendChild(renderSpectatorNight(meta, me));
+    } else if (meta.phase === "day_reveal") {
+      wrap.appendChild(renderDayReveal(meta, me));
+    } else if (meta.phase === "day_discussion") {
+      wrap.appendChild(renderDiscussion(meta, me, true));
+    } else if (meta.phase === "day_voting") {
+      wrap.appendChild(renderVoting(meta, me, true));
+    } else if (meta.phase === "day_results") {
+      wrap.appendChild(renderDayResults(meta, me, true));
+    }
   } else if (meta.phase === "night") {
     wrap.appendChild(renderNightPanel(meta, me));
   } else if (meta.phase === "day_reveal") {
@@ -2491,7 +2683,7 @@ async function playNightSounds() {
   }, 4200);
 }
 
-function renderNightTransition(meta) {
+function renderNightTransition(meta, me = null) {
   const transitionTotalMs = NIGHT_TRANSITION_SECONDS * 1000;
   const remainingMs = getPhaseRemainingMs(meta);
   const elapsedMs = Math.min(
@@ -2506,6 +2698,7 @@ function renderNightTransition(meta) {
     <div class="night-cloud cloud-c"></div>
     <div class="night-cloud cloud-d"></div>
     <div class="night-cloud cloud-e"></div>
+    ${me && !me.alive ? renderGhostIndicator() : ""}
     <div class="night-transition-content">
       <div class="transition-moon">${moonSvg(72)}</div>
       <p class="transition-eyebrow">MEIA-NOITE</p>
@@ -2545,19 +2738,26 @@ function renderRoundTraitRevealHtml(meta) {
   const revealed = Array.isArray(meta.revealedTraits)
     ? meta.revealedTraits
     : [];
-  if (!revealed.length) {
+  const cluesPerRound = Math.max(1, Number(meta.cluesPerRound) || 1);
+  const round = Number(meta.round) || 1;
+  const current =
+    round > 1
+      ? revealed.slice(Math.max(0, revealed.length - cluesPerRound))
+      : [];
+
+  if (!current.length) {
     return `<div class="investigation-private-info round-trait-reveal"><div class="investigation-private-title">Nenhuma nova informação nesta rodada.</div></div>`;
   }
 
   return `<div class="investigation-private-info round-trait-reveal">
     <div class="investigation-private-title">🔎 Nova informação sobre o assassino</div>
-    <ol>${revealed
+    <ol>${current
       .map((item) => {
         const label = TRAIT_CATEGORIES[item.axis]?.label || item.axis;
         return `<li><strong>${esc(label)}:</strong> ${esc(item.value)}</li>`;
       })
       .join("")}</ol>
-    <small>Essas informações são verdadeiras e ficam disponíveis para todos.</small>
+    <small>Essa informação é verdadeira e fica disponível para todos.</small>
   </div>`;
 }
 
@@ -2614,14 +2814,79 @@ function renderRoleReveal(meta, me) {
   return card;
 }
 
+function renderGhostIndicator() {
+  return `<div class="ghost-indicator" aria-label="Você está morto e acompanhando a partida">
+    <span class="ghost-symbol">👻</span>
+    <span>ESPECTADOR — VOCÊ ESTÁ MORTO</span>
+  </div>`;
+}
+
 function renderSpectator(meta, me) {
-  return el(`<div class="card death-banner">
+  return el(`<div class="card death-banner death-screen-cinematic">
+    <div class="death-screen-glow"></div>
     ${skullSvg(58)}
     <h2>Você morreu</h2>
     <p>Você foi eliminado(a) da partida.</p>
     <p style="margin-top:8px;color:var(--ui-muted);">Seu papel era <strong>${esc(ROLE_INFO[me.role]?.name || "não identificado")}</strong>.</p>
-    <p style="margin-top:8px;color:var(--ui-muted);">Continue na sala e acompanhe o que acontece até o fim.</p>
+    <p style="margin-top:8px;color:var(--ui-muted);">Acompanhe a partida como um fantasma até o fim.</p>
   </div>`);
+}
+
+function renderSpectatorNight(meta, me) {
+  const players = (state.players || []).filter((p) => p.alive);
+  const actions = state.spectatorNightActions || [];
+  const actionByPlayer = new Map(actions.map((a) => [a.playerId, a]));
+
+  const card = el(`<div class="card spectator-night-card">
+    <div class="discussion-head">
+      ${moonSvg(42)}
+      <div><p class="eyebrow">FASE DAS AÇÕES</p><h2>Você observa a cidade.</h2></div>
+    </div>
+    <p class="tagline">Como fantasma, você pode acompanhar as ações noturnas em tempo real.</p>
+    <div class="spectator-action-list" id="spectator-actions"></div>
+  </div>`);
+
+  const list = card.querySelector("#spectator-actions");
+  players.forEach((p) => {
+    const action = actionByPlayer.get(p.id);
+    let text = "aguardando ação";
+    let tone = "waiting";
+
+    if (action) {
+      const target =
+        players.find((x) => x.id === action.targetId) ||
+        (state.players || []).find((x) => x.id === action.targetId);
+      const targetName = target?.name || "alguém";
+
+      if (action.role === "detetive") {
+        const axis = action.targetAxis
+          ? TRAIT_CATEGORIES[action.targetAxis]?.label || action.targetAxis
+          : "traço";
+        text = `investigou ${targetName} — ${axis}`;
+      } else if (action.role === "anjo") {
+        text = `protegeu ${targetName}`;
+      } else if (action.role === "assassino") {
+        text = `atacou ${targetName}`;
+      } else {
+        text = "realizou sua ação";
+      }
+      tone = "done";
+    }
+
+    const roleName = ROLE_INFO[p.role]?.name || p.role;
+    const row = el(`<div class="spectator-action-row ${tone}">
+      ${playerAvatar(p.name)}
+      <div class="spectator-action-main">
+        <strong>${esc(p.name)}</strong>
+        <span>${esc(roleName)}</span>
+      </div>
+      <span class="spectator-action-dot" aria-hidden="true"></span>
+      <div class="spectator-action-text">${esc(text)}</div>
+    </div>`);
+    list.appendChild(row);
+  });
+
+  return card;
 }
 
 function roleAvatar(role, className = "role-avatar") {
@@ -2710,9 +2975,13 @@ function renderNightPanel(meta, me) {
 
     button.onclick = () => {
       if (state.nightActionConfirmed) return;
-      state.selectedTarget = t.id;
-      if (me.role !== "detetive") state.selectedAxis = null;
-      else state.selectedAxis = selected ? state.selectedAxis : null;
+      if (selected && me.role === "detetive") {
+        state.selectedTarget = null;
+        state.selectedAxis = null;
+      } else {
+        state.selectedTarget = t.id;
+        state.selectedAxis = null;
+      }
       render();
     };
     row.appendChild(button);
@@ -2724,7 +2993,7 @@ function renderNightPanel(meta, me) {
       </div>`);
       const options = popover.querySelector("#axis-options");
 
-      getActiveAxes(meta).forEach((axis) => {
+      getInvestigationAxes(meta).forEach((axis) => {
         const optionRow = el(`<div class="trait-popover-option-row"></div>`);
         const option = el(
           `<button class="trait-popover-option ${state.selectedAxis === axis ? "selected" : ""}"><span>${esc(TRAIT_CATEGORIES[axis].label)}</span></button>`,
@@ -2773,6 +3042,12 @@ function renderNightPanel(meta, me) {
             `<div class="investigation-result"><div><strong>${esc(chosen.name)} — ${esc(label)}</strong><p>${esc(value)}</p></div></div>`,
           ),
         );
+      } else if (chosen) {
+        box.appendChild(
+          el(
+            `<div class="investigation-result"><div><strong>${esc(chosen.name)} — ${esc(label)}</strong><p>Nenhuma informação registrada.</p></div></div>`,
+          ),
+        );
       }
     } else {
       box.appendChild(
@@ -2788,12 +3063,30 @@ function renderNightPanel(meta, me) {
 }
 
 function renderDayReveal(meta, me) {
-  const message = meta.lastDeathName
+  const hasDeath = Boolean(meta.lastDeathName);
+  const message = hasDeath
     ? `${esc(meta.lastDeathName)} não sobreviveu à noite.`
     : "Ninguém morreu esta noite.";
-  const card = el(
-    `<div class="card day-event-card"><div class="event-icon death-icon">${meta.lastDeathName ? skullSvg(58) : sunriseSvg(58)}</div><p class="eyebrow">AO AMANHECER</p><h2>${message}</h2><p class="tagline">A cidade terá alguns segundos para absorver o que aconteceu.</p><div class="phase-mini-timer" id="day-reveal-timer">00:07</div></div>`,
-  );
+
+  const card =
+    el(`<div class="card day-event-card day-reveal-screen ${hasDeath ? "death-awakening" : ""}">
+    <div class="event-icon death-icon">${hasDeath ? skullSvg(58) : sunriseSvg(58)}</div>
+    <p class="eyebrow">AO AMANHECER</p>
+    <h2>${message}</h2>
+    <p class="tagline">${hasDeath ? "A cidade desperta lentamente para a notícia." : "A cidade desperta. Ninguém foi perdido esta noite."}</p>
+    <div class="phase-mini-timer" id="day-reveal-timer">00:07</div>
+  </div>`);
+
+  if (hasDeath && state.lastDeathSoundRound !== Number(meta.round)) {
+    state.lastDeathSoundRound = Number(meta.round);
+    try {
+      const audio = new Audio(AUDIO_ASSETS.death);
+      audio.preload = "auto";
+      audio.volume = 0.72;
+      audio.play().catch(() => {});
+    } catch (_) {}
+  }
+
   attachCountdown(card.querySelector("#day-reveal-timer"), meta);
   return card;
 }
@@ -2804,12 +3097,14 @@ function renderInvestigationPanelHtml(me) {
   return `<div class="investigation-panel"><div class="investigation-panel-title">${me.role === "detetive" ? "🔎 Seus traços" : "📜 Suas informações"}</div><ol>${items.map((item) => `<li>${esc(item.text_snapshot)}</li>`).join("")}</ol><small>Informações reais da partida.</small></div>`;
 }
 
-function renderDiscussion(meta, me) {
-  const card = el(`<div class="card discussion-card">
+function renderDiscussion(meta, me, spectator = false) {
+  const card =
+    el(`<div class="card discussion-card ${spectator ? "spectator-phase-card" : ""}">
     <div class="discussion-head">
       ${sunSvg(42)}
       <div><p class="eyebrow">FASE DE DISCUSSÃO</p><h2>Conversem e descubram os assassinos.</h2></div>
     </div>
+    ${spectator ? `<div class="ghost-phase-note">👻 Você está morto, mas continua acompanhando a discussão.</div>` : ""}
     <div class="timer-panel"><span>Tempo restante</span><strong id="timer-display">--:--</strong></div>
     <p class="footnote">A discussão termina automaticamente. Depois começa a votação.</p>
   </div>`);
@@ -2817,7 +3112,18 @@ function renderDiscussion(meta, me) {
   return card;
 }
 
-function renderVoting(meta, me) {
+function getVoteCount(targetId) {
+  return (state.currentVotes || []).filter((v) => v.targetId === targetId)
+    .length;
+}
+
+function voteBubblesHtml(count) {
+  if (!count)
+    return `<span class="vote-bubbles empty" aria-label="Nenhum voto"></span>`;
+  return `<span class="vote-bubbles" aria-label="${count} voto(s)">${"👤".repeat(Math.min(count, 8))}${count > 8 ? ` +${count - 8}` : ""}</span>`;
+}
+
+function renderVoting(meta, me, spectator = false) {
   const alivePlayers = (state.players || []).filter((p) => p.alive);
   const confirmed = state.voteConfirmed;
   const selectedName =
@@ -2825,50 +3131,61 @@ function renderVoting(meta, me) {
       ? "Pular"
       : alivePlayers.find((p) => p.id === state.selectedTarget)?.name || null;
 
-  const box = el(`<div class="card voting-card">
+  const box =
+    el(`<div class="card voting-card ${spectator ? "spectator-phase-card" : ""}">
     <div class="discussion-head">
       ${ballotSvg(42)}
       <div><p class="eyebrow">FASE DE VOTAÇÃO</p><h2>Escolha uma pessoa para votar.</h2></div>
     </div>
+    ${spectator ? `<div class="ghost-phase-note">👻 Você está morto. Pode acompanhar os votos, mas não pode votar.</div>` : ""}
     <div class="timer-panel"><span>Tempo restante</span><strong id="vote-timer">--:--</strong></div>
-    <p class="vote-instruction">Selecione sua escolha. Depois confira o ✓ e confirme o voto.</p>
+    ${spectator ? `<p class="vote-instruction">Os bonecos mostram quantas pessoas já votaram em cada opção.</p>` : `<p class="vote-instruction">Selecione sua escolha e confirme o voto.</p>`}
     <div class="target-grid visual-target-grid" id="vote-targets"></div>
-    <button class="target-btn skip-button ${state.selectedTarget === "abstain" ? "selected" : ""}" id="vote-abstain" ${confirmed ? "disabled" : ""}>${playerAvatar("P")}<span>Pular</span>${state.selectedTarget === "abstain" ? '<span class="selection-check">✓</span>' : ""}</button>
-    <div class="vote-confirmation-area">
-      ${selectedName ? `<div class="selected-vote-summary"><span>Escolha:</span><strong>${esc(selectedName)}</strong>${confirmed ? '<span class="confirmed-vote-check">✓ Confirmado</span>' : '<span class="pending-vote-check">✓ Selecionado</span>'}</div>` : '<div class="selected-vote-summary empty">Nenhuma escolha selecionada.</div>'}
-      <button class="btn btn-primary vote-confirm-btn" id="btn-confirm-vote" ${!state.selectedTarget || confirmed ? "disabled" : ""}>${confirmed ? "✓ Voto confirmado" : "Confirmar votação"}</button>
+    <div class="vote-skip-row">
+      <div class="target-btn skip-button ${state.selectedTarget === "abstain" ? "selected" : ""} ${spectator ? "spectator-option" : ""}">
+        ${playerAvatar("P")}<span>Pular</span>${voteBubblesHtml(getVoteCount("abstain"))}
+        ${!spectator && state.selectedTarget === "abstain" ? '<span class="selection-check">✓</span>' : ""}
+      </div>
     </div>
+    ${
+      spectator
+        ? ""
+        : `<div class="vote-confirmation-area">
+          ${selectedName ? `<div class="selected-vote-summary"><span>Escolha:</span><strong>${esc(selectedName)}</strong>${confirmed ? '<span class="confirmed-vote-check">✓ Confirmado</span>' : '<span class="pending-vote-check">✓ Selecionado</span>'}</div>` : '<div class="selected-vote-summary empty">Nenhuma escolha selecionada.</div>'}
+          <button class="btn btn-primary vote-confirm-btn" id="btn-confirm-vote" ${!state.selectedTarget || confirmed ? "disabled" : ""}>${confirmed ? "✓ Voto confirmado" : "Confirmar votação"}</button>
+        </div>`
+    }
     <p class="footnote">A votação termina automaticamente quando todos votarem ou quando o tempo acabar. Se você não confirmar, contará como Pular ao final.</p>
   </div>`);
 
   const grid = box.querySelector("#vote-targets");
-  alivePlayers
-    .filter((p) => p.id !== me.id)
-    .forEach((t) => {
-      const b = el(
-        `<button class="target-btn visual-target-button" ${confirmed ? "disabled" : ""}></button>`,
-      );
-      b.innerHTML = `${playerAvatar(t.name)}<span>${esc(t.name)}</span>${state.selectedTarget === t.id ? '<span class="selection-check">✓</span>' : ""}`;
-      if (state.selectedTarget === t.id) b.classList.add("selected");
+  alivePlayers.forEach((t) => {
+    const isMe = t.id === me.id;
+    if (!spectator && isMe) return;
+
+    const count = getVoteCount(t.id);
+    const b = el(
+      `<button class="target-btn visual-target-button ${spectator ? "spectator-option" : ""}" ${spectator || confirmed ? "disabled" : ""}></button>`,
+    );
+    b.innerHTML = `${playerAvatar(t.name)}<span>${esc(t.name)}</span>${voteBubblesHtml(count)}${!spectator && state.selectedTarget === t.id ? '<span class="selection-check">✓</span>' : ""}`;
+    if (!spectator && state.selectedTarget === t.id)
+      b.classList.add("selected");
+
+    if (!spectator) {
       b.onclick = () => {
         if (!state.voteConfirmed) {
           state.selectedTarget = t.id;
           render();
         }
       };
-      grid.appendChild(b);
-    });
-
-  const abstainBtn = box.querySelector("#vote-abstain");
-  abstainBtn.onclick = () => {
-    if (!state.voteConfirmed) {
-      state.selectedTarget = "abstain";
-      render();
     }
-  };
+    grid.appendChild(b);
+  });
 
-  const confirmBtn = box.querySelector("#btn-confirm-vote");
-  confirmBtn.onclick = confirmVote;
+  if (!spectator) {
+    const confirmBtn = box.querySelector("#btn-confirm-vote");
+    if (confirmBtn) confirmBtn.onclick = confirmVote;
+  }
 
   attachCountdown(box.querySelector("#vote-timer"), meta);
   return box;
@@ -3447,6 +3764,68 @@ function trophySvg(size = 64) {
     .lobby-settings select{min-height:48px;display:block;}
     .lobby-settings .field{position:relative;z-index:3;}
     .center-stage .card{box-shadow:0 20px 70px rgba(0,0,0,.3),inset 0 1px 0 rgba(255,255,255,.035) !important;}
+    .lobby-top-actions{display:flex;align-items:center;gap:10px;}
+    .settings-gear{width:42px;height:42px;border:1px solid rgba(242,192,120,.34);border-radius:12px;background:rgba(7,23,54,.72);color:var(--ui-gold);font-size:1.2rem;cursor:pointer;transition:.18s ease;}
+    .settings-gear:hover{transform:translateY(-1px);border-color:rgba(242,192,120,.7);background:rgba(12,31,67,.9);}
+    .lobby-settings-summary{width:min(100%,720px);margin:18px auto 0;display:flex;align-items:center;justify-content:space-between;gap:18px;box-sizing:border-box;}
+    .settings-summary-btn{width:auto;min-width:0;padding:6px 10px;border-radius:10px;font-size:.7rem;line-height:1.2;letter-spacing:.08em;text-transform:uppercase;white-space:nowrap;}
+    .settings-modal-backdrop{position:fixed;inset:0;z-index:200;display:grid;place-items:center;padding:20px;background:rgba(1,7,20,.78);backdrop-filter:blur(8px);}
+    .settings-modal{width:min(620px,94vw);max-height:90vh;overflow:auto;padding:24px;border:1px solid rgba(242,192,120,.36);border-radius:18px;background:linear-gradient(180deg,#081a3a,#041127);box-shadow:0 30px 90px rgba(0,0,0,.6);}
+    .settings-modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:18px;}
+    .settings-modal-head h2{margin:0;font-family:Georgia,serif;font-weight:500;}
+    .settings-close{width:38px;height:38px;border:1px solid var(--ui-line);border-radius:10px;background:rgba(255,255,255,.025);color:var(--ui-muted);font-size:1.5rem;cursor:pointer;}
+    .settings-check-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:9px;}
+    .settings-check{display:flex;align-items:center;gap:9px;padding:11px 12px;border:1px solid var(--ui-line);border-radius:10px;background:rgba(255,255,255,.018);cursor:pointer;}
+    .settings-check input{accent-color:#f2c078;}
+    .settings-modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:20px;}
+    .ghost-indicator{position:relative;z-index:20;display:flex;align-items:center;justify-content:center;gap:9px;width:max-content;max-width:100%;margin:0 auto 14px;padding:7px 12px;border:1px solid rgba(180,194,220,.25);border-radius:999px;background:rgba(10,20,42,.82);color:#aab6ca;font-size:.68rem;font-weight:700;letter-spacing:.12em;box-shadow:0 8px 24px rgba(0,0,0,.22);}
+    .ghost-symbol{font-size:1rem;line-height:1;}
+    .dead-player-view .phase-banner{opacity:.86;}
+    .ghost-phase-note{margin:0 0 14px;padding:10px 12px;border:1px solid rgba(180,194,220,.2);border-radius:10px;background:rgba(255,255,255,.018);color:#aab6ca;text-align:center;font-size:.86rem;}
+    .spectator-night-card{overflow:visible;}
+    .spectator-action-list{display:grid;gap:8px;margin-top:18px;}
+    .spectator-action-row{display:grid;grid-template-columns:34px minmax(120px,180px) 10px minmax(0,1fr);align-items:center;gap:10px;padding:11px 12px;border:1px solid var(--ui-line);border-radius:12px;background:rgba(255,255,255,.018);}
+    .spectator-action-main{display:grid;gap:2px;min-width:0;}
+    .spectator-action-main strong{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+    .spectator-action-main span{font-size:.75rem;color:var(--ui-muted);}
+    .spectator-action-dot{width:8px;height:8px;border-radius:50%;background:#7d8ba3;box-shadow:0 0 0 4px rgba(125,139,163,.08);}
+    .spectator-action-row.done .spectator-action-dot{background:#f2c078;box-shadow:0 0 0 4px rgba(242,192,120,.08);}
+    .spectator-action-text{color:#d8e1f2;font-size:.88rem;}
+    .vote-bubbles{margin-left:auto;display:flex;align-items:center;justify-content:flex-end;gap:1px;white-space:nowrap;font-size:1rem;letter-spacing:-.2em;min-width:24px;}
+    .vote-bubbles.empty{min-width:24px;}
+    .vote-skip-row{margin-top:10px;}
+    .vote-skip-row .skip-button{margin-top:0 !important;}
+    .spectator-option{cursor:default !important;}
+    .day-reveal-screen{position:relative;overflow:hidden;}
+    .death-awakening{animation:deathAwakening 7s cubic-bezier(.2,.6,.2,1) both;}
+    .death-awakening .event-icon,.death-awakening .eyebrow,.death-awakening h2,.death-awakening .tagline,.death-awakening .phase-mini-timer{animation:deathContentIn 6.4s ease both;}
+    @keyframes deathAwakening{
+      0%{opacity:0;transform:scale(.985);filter:blur(7px);}
+      32%{opacity:.18;filter:blur(5px);}
+      68%{opacity:.58;filter:blur(2px);}
+      100%{opacity:1;transform:scale(1);filter:blur(0);}
+    }
+    @keyframes deathContentIn{
+      0%{opacity:0;transform:translateY(12px);}
+      60%{opacity:.35;transform:translateY(4px);}
+      100%{opacity:1;transform:translateY(0);}
+    }
+    .death-screen-cinematic{animation:deathScreenFade 4.8s cubic-bezier(.2,.65,.2,1) both;}
+    @keyframes deathScreenFade{
+      from{opacity:0;transform:scale(.985);filter:blur(5px);}
+      to{opacity:1;transform:scale(1);filter:blur(0);}
+    }
+    .death-screen-glow{position:absolute;inset:0;pointer-events:none;background:radial-gradient(circle at 50% 45%,rgba(232,91,101,.07),transparent 58%);}
+    @media(max-width:640px){
+      .settings-check-grid{grid-template-columns:1fr;}
+      .settings-modal-actions{flex-direction:column-reverse;}
+      .settings-modal-actions .btn{width:100%;}
+      .lobby-settings-summary{align-items:flex-start;flex-direction:column;}
+      .spectator-action-row{grid-template-columns:34px 1fr;gap:8px;}
+      .spectator-action-dot{display:none;}
+      .spectator-action-text{grid-column:2;}
+    }
+
     @media(max-width:640px){
       .role-image-frame{width:min(84vw,350px) !important;}
       .final-role-chip{grid-template-columns:42px 1fr;}
