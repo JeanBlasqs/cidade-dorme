@@ -837,6 +837,8 @@ const state = {
   currentVotes: [],
   spectatorNightActions: [],
   lastDeathSoundRound: null,
+  deathSequenceActive: false,
+  deathSequenceRound: null,
   nightRoleDone: { assassino: false, detetive: false, anjo: false },
   refreshInFlight: false,
   refreshQueued: false,
@@ -986,6 +988,28 @@ async function refreshOnce() {
   const players = (await fetchPlayers(state.roomCode)) || [];
   const previousPhase = state.lastPhaseSeen;
 
+  // Detecta somente a transição deste jogador: vivo -> morto.
+  // Os demais jogadores continuam vendo o fluxo normal da rodada.
+  const previousMe = (state.players || []).find(
+    (p) => p.id === state.playerId,
+  );
+  const nextMe = players.find((p) => p.id === state.playerId);
+  const justDied =
+    previousMe?.alive === true &&
+    nextMe?.alive === false &&
+    meta.status === "active";
+
+  if (justDied && state.deathSequenceRound !== Number(meta.round)) {
+    state.deathSequenceActive = true;
+    state.deathSequenceRound = Number(meta.round);
+    playDeathSequenceSound();
+
+    window.setTimeout(() => {
+      state.deathSequenceActive = false;
+      render();
+    }, 5200);
+  }
+
   state.room = meta;
   state.players = players;
 
@@ -1023,6 +1047,8 @@ async function refreshOnce() {
     state.lastPhaseSeen = null;
     state.phaseClientDeadline = null;
     state.lastDataSignature = null;
+    state.deathSequenceActive = false;
+    state.deathSequenceRound = null;
   } else if (meta.status === "active" && state.screen !== "game") {
     state.screen = "game";
     state.selectedTarget = null;
@@ -2534,6 +2560,12 @@ function renderGame() {
   const me = myPlayer();
   if (!me) return el(`<div class="wrap"><p>Carregando jogador...</p></div>`);
 
+  // A morte do próprio jogador acontece por cima da fase atual.
+  // Depois da animação, o render normal continua e ele vira espectador.
+  if (state.deathSequenceActive) {
+    return renderDeathSequence(me);
+  }
+
   // As duas fases cinematográficas ocupam a tela inteira.
   // Assim a revelação e a chegada da noite não ficam presas dentro do layout normal.
   if (meta.phase === "role_reveal")
@@ -3062,6 +3094,41 @@ function renderNightPanel(meta, me) {
   return card;
 }
 
+function playDeathSequenceSound() {
+  try {
+    const audio = new Audio(AUDIO_ASSETS.death);
+    audio.preload = "auto";
+    audio.volume = 0.72;
+    audio.currentTime = 0;
+    audio.play().catch(() => {});
+  } catch (_) {}
+}
+
+function renderDeathSequence(me) {
+  return el(`
+    <div class="death-sequence-screen">
+      <div class="death-sequence-eyelid death-sequence-eyelid-top"></div>
+      <div class="death-sequence-eyelid death-sequence-eyelid-bottom"></div>
+
+      <div class="death-sequence-message">
+        <div class="death-sequence-skull">
+          ${skullSvg(64)}
+        </div>
+
+        <p class="eyebrow">A NOITE TERMINOU</p>
+        <h1>Você morreu</h1>
+        <p>
+          Seu papel era
+          <strong>${esc(ROLE_INFO[me.role]?.name || "não identificado")}</strong>.
+        </p>
+        <p class="death-sequence-ghost">
+          Agora você continuará acompanhando a cidade como um fantasma.
+        </p>
+      </div>
+    </div>
+  `);
+}
+
 function renderDayReveal(meta, me) {
   const hasDeath = Boolean(meta.lastDeathName);
   const message = hasDeath
@@ -3076,16 +3143,6 @@ function renderDayReveal(meta, me) {
     <p class="tagline">${hasDeath ? "A cidade desperta lentamente para a notícia." : "A cidade desperta. Ninguém foi perdido esta noite."}</p>
     <div class="phase-mini-timer" id="day-reveal-timer">00:07</div>
   </div>`);
-
-  if (hasDeath && state.lastDeathSoundRound !== Number(meta.round)) {
-    state.lastDeathSoundRound = Number(meta.round);
-    try {
-      const audio = new Audio(AUDIO_ASSETS.death);
-      audio.preload = "auto";
-      audio.volume = 0.72;
-      audio.play().catch(() => {});
-    } catch (_) {}
-  }
 
   attachCountdown(card.querySelector("#day-reveal-timer"), meta);
   return card;
@@ -3143,7 +3200,11 @@ function renderVoting(meta, me, spectator = false) {
     <div class="target-grid visual-target-grid" id="vote-targets"></div>
     <div class="vote-skip-row">
       <div class="target-btn skip-button ${state.selectedTarget === "abstain" ? "selected" : ""} ${spectator ? "spectator-option" : ""}">
-        ${playerAvatar("P")}<span>Pular</span>${voteBubblesHtml(getVoteCount("abstain"))}
+        <span class="target-identity">
+          ${playerAvatar("P")}
+          <span>Pular</span>
+        </span>
+        ${voteBubblesHtml(getVoteCount("abstain"))}
         ${!spectator && state.selectedTarget === "abstain" ? '<span class="selection-check">✓</span>' : ""}
       </div>
     </div>
@@ -3167,7 +3228,15 @@ function renderVoting(meta, me, spectator = false) {
     const b = el(
       `<button class="target-btn visual-target-button ${spectator ? "spectator-option" : ""}" ${spectator || confirmed ? "disabled" : ""}></button>`,
     );
-    b.innerHTML = `${playerAvatar(t.name)}<span>${esc(t.name)}</span>${voteBubblesHtml(count)}${!spectator && state.selectedTarget === t.id ? '<span class="selection-check">✓</span>' : ""}`;
+    b.innerHTML = `
+      <span class="target-identity">
+        ${playerAvatar(t.name)}
+        <span>${esc(t.name)}</span>
+      </span>
+      ${voteBubblesHtml(count)}
+      ${!spectator && state.selectedTarget === t.id
+        ? '<span class="selection-check">✓</span>'
+        : ""}`;
     if (!spectator && state.selectedTarget === t.id)
       b.classList.add("selected");
 
@@ -3954,6 +4023,87 @@ document.addEventListener("pointerdown", unlockAudio, { passive: true });
     #btn-ready{width:min(100%,420px);margin:8px auto 0;display:block;}
     #btn-ready:disabled{opacity:.75;cursor:default;}
     #ready-count{margin-top:10px;text-align:center;}
-  `;
+  
+
+    /* =========================================================
+       MORTE — TRANSIÇÃO CINEMATOGRÁFICA DA VÍTIMA
+       ========================================================= */
+    .death-sequence-screen {
+      position: fixed;
+      inset: 0;
+      z-index: 10000;
+      width: 100vw;
+      height: 100dvh;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      background: #000;
+      color: #eef3ff;
+      isolation: isolate;
+    }
+    .death-sequence-eyelid {
+      position: absolute;
+      left: 0;
+      right: 0;
+      height: 50%;
+      background: #000;
+      z-index: 2;
+      pointer-events: none;
+    }
+    .death-sequence-eyelid-top {
+      top: 0;
+      transform: translateY(-100%);
+      animation: deathEyeTop 5.2s cubic-bezier(.7, 0, .2, 1) both;
+    }
+    .death-sequence-eyelid-bottom {
+      bottom: 0;
+      transform: translateY(100%);
+      animation: deathEyeBottom 5.2s cubic-bezier(.7, 0, .2, 1) both;
+    }
+    .death-sequence-message {
+      position: relative;
+      z-index: 3;
+      width: min(90vw, 520px);
+      text-align: center;
+      opacity: 0;
+      animation: deathMessage 5.2s ease both;
+      padding: 24px;
+      box-sizing: border-box;
+    }
+    .death-sequence-skull { color: #e85b65; margin-bottom: 14px; }
+    .death-sequence-message h1 {
+      margin: 6px 0 12px;
+      color: #e85b65;
+      font-family: Georgia, serif;
+      font-size: clamp(2.4rem, 8vw, 4rem);
+      font-weight: 500;
+    }
+    .death-sequence-message p { color: #aebbd2; font-size: .95rem; line-height: 1.5; }
+    .death-sequence-message strong { color: #f2c078; }
+    .death-sequence-ghost { margin-top: 16px !important; color: #7f91af !important; font-size: .82rem !important; }
+    @keyframes deathEyeTop {
+      0% { transform: translateY(-100%); }
+      7% { transform: translateY(-100%); }
+      30% { transform: translateY(0); }
+      47% { transform: translateY(0); }
+      100% { transform: translateY(-100%); }
+    }
+    @keyframes deathEyeBottom {
+      0% { transform: translateY(100%); }
+      7% { transform: translateY(100%); }
+      30% { transform: translateY(0); }
+      47% { transform: translateY(0); }
+      100% { transform: translateY(100%); }
+    }
+    @keyframes deathMessage {
+      0%, 47% { opacity: 0; transform: scale(.96); filter: blur(5px); }
+      61% { opacity: 0; }
+      73%, 100% { opacity: 1; transform: scale(1); filter: blur(0); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .death-sequence-eyelid { animation-duration: 1ms !important; }
+      .death-sequence-message { animation-duration: 1ms !important; opacity: 1; }
+    }
+`;
   document.head.appendChild(style);
 })();
