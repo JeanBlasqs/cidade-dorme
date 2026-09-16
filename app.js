@@ -326,22 +326,22 @@ const SCENARIO_PRESETS = {
     name: "Prefeitura",
     description: "Prédios públicos, arquivos e a praça central.",
     local: ["escritório", "salão de reuniões", "banheiro"],
-    objeto: ["tesoura", "chave inglesa", "pasta com documentos"],
+    objeto: ["tesoura", "chave inglesa", "maleta"],
     vestimenta: ["terno escuro", "camisa social clara", "casaco"],
   },
   cassino: {
     name: "Cassino",
     description: "Luzes, mesas de jogo e corredores reservados.",
     local: ["salão principal", "sala VIP", "banheiro"],
-    objeto: ["faca de cozinha", "abridor de cartas", "ficha metálica"],
+    objeto: ["faca de cozinha", "abridor de cartas", "Taça de vinho"],
     vestimenta: ["terno preto", "camisa vermelha", "jaqueta escura"],
   },
   praia: {
     name: "Praia",
     description: "Calçadão, quiosques e areia à noite.",
     local: ["quiosque", "estacionamento", "vestiário"],
-    objeto: ["canivete", "tesoura", "garrafa de vidro"],
-    vestimenta: ["camiseta clara", "regata escura", "jaqueta"],
+    objeto: ["canivete", "embalagem", "garrafa de vidro"],
+    vestimenta: ["camiseta clara", "regata escura", "óculos"],
   },
   festa: {
     name: "Festa",
@@ -3378,7 +3378,20 @@ function renderDayReveal(meta, me) {
     <div class="phase-mini-timer" id="day-reveal-timer">00:07</div>
   </div>`);
 
+  // 🔊 TODOS os jogadores escutam o som da morte
+  if (hasDeath && state.lastDeathSoundRound !== Number(meta.round)) {
+    state.lastDeathSoundRound = Number(meta.round);
+
+    try {
+      const audio = new Audio(AUDIO_ASSETS.death);
+      audio.preload = "auto";
+      audio.volume = 0.72;
+      audio.play().catch(() => {});
+    } catch (_) {}
+  }
+
   attachCountdown(card.querySelector("#day-reveal-timer"), meta);
+
   return card;
 }
 
