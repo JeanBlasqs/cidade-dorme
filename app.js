@@ -51,9 +51,7 @@ function metaFromRow(row) {
           ? 1
           : Math.max(0, Number(row.detective_count) || 0),
       anjo:
-        row.angel_count == null
-          ? 1
-          : Math.max(0, Number(row.angel_count) || 0),
+        row.angel_count == null ? 1 : Math.max(0, Number(row.angel_count) || 0),
     },
   };
 }
@@ -963,7 +961,10 @@ async function updateRoomSettings(
 
   const players = (await fetchPlayers(state.roomCode)) || [];
   if (players.length >= 4) {
-    const normalized = normalizeRoleCountsForPlayers(players.length, roleCounts);
+    const normalized = normalizeRoleCountsForPlayers(
+      players.length,
+      roleCounts,
+    );
     const specialTotal =
       normalized.assassino + normalized.detetive + normalized.anjo;
     if (specialTotal > players.length - 1) {
@@ -1054,9 +1055,7 @@ async function refreshOnce() {
 
   // Detecta somente a transição deste jogador: vivo -> morto.
   // Os demais jogadores continuam vendo o fluxo normal da rodada.
-  const previousMe = (state.players || []).find(
-    (p) => p.id === state.playerId,
-  );
+  const previousMe = (state.players || []).find((p) => p.id === state.playerId);
   const nextMe = players.find((p) => p.id === state.playerId);
   const justDied =
     previousMe?.alive === true &&
@@ -2441,7 +2440,7 @@ function renderLobby() {
     ${
       players.length < 4
         ? `<p class="status-line">São necessários pelo menos 4 jogadores para começar e configurar os papéis.</p>`
-        : `<p class="tagline lobby-role-summary">Com ${players.length} jogadores: ${esc(roleCountLabel(roleCounts))}.</p>`
+        : ``
     }
 
 <div class="card lobby-settings-summary"> 
@@ -2503,20 +2502,38 @@ function renderLobby() {
                     ? `<div class="role-settings-grid">
                         <label class="role-setting-item">
                           <span>Assassinos</span>
-                          <select id="role-count-assassino">${Array.from({ length: players.length }, (_, i) => i + 1)
-                            .map((v) => `<option value="${v}" ${roleCounts.assassino === v ? "selected" : ""}>${v}</option>`)
+                          <select id="role-count-assassino">${Array.from(
+                            { length: players.length },
+                            (_, i) => i + 1,
+                          )
+                            .map(
+                              (v) =>
+                                `<option value="${v}" ${roleCounts.assassino === v ? "selected" : ""}>${v}</option>`,
+                            )
                             .join("")}</select>
                         </label>
                         <label class="role-setting-item">
                           <span>Detetives</span>
-                          <select id="role-count-detetive">${Array.from({ length: players.length }, (_, i) => i)
-                            .map((v) => `<option value="${v}" ${roleCounts.detetive === v ? "selected" : ""}>${v}</option>`)
+                          <select id="role-count-detetive">${Array.from(
+                            { length: players.length },
+                            (_, i) => i,
+                          )
+                            .map(
+                              (v) =>
+                                `<option value="${v}" ${roleCounts.detetive === v ? "selected" : ""}>${v}</option>`,
+                            )
                             .join("")}</select>
                         </label>
                         <label class="role-setting-item">
                           <span>Anjos</span>
-                          <select id="role-count-anjo">${Array.from({ length: players.length }, (_, i) => i)
-                            .map((v) => `<option value="${v}" ${roleCounts.anjo === v ? "selected" : ""}>${v}</option>`)
+                          <select id="role-count-anjo">${Array.from(
+                            { length: players.length },
+                            (_, i) => i,
+                          )
+                            .map(
+                              (v) =>
+                                `<option value="${v}" ${roleCounts.anjo === v ? "selected" : ""}>${v}</option>`,
+                            )
                             .join("")}</select>
                         </label>
                         <div class="role-setting-item role-setting-readonly">
@@ -2665,7 +2682,8 @@ function renderLobby() {
     const categoryChecks = [...wrap.querySelectorAll(".trait-category")];
 
     const updateRoleCount = () => {
-      if (!assassinCountSelect || !detectiveCountSelect || !angelCountSelect) return;
+      if (!assassinCountSelect || !detectiveCountSelect || !angelCountSelect)
+        return;
       const assassino = Math.max(1, Number(assassinCountSelect.value) || 1);
       const detetive = Math.max(0, Number(detectiveCountSelect.value) || 0);
       const anjo = Math.max(0, Number(angelCountSelect.value) || 0);
@@ -2693,12 +2711,17 @@ function renderLobby() {
         Number(assassinCountSelect.value) +
         Number(detectiveCountSelect.value) +
         Number(angelCountSelect.value);
-      if (citizenCountDisplay) citizenCountDisplay.textContent = String(Math.max(0, players.length - currentTotal));
+      if (citizenCountDisplay)
+        citizenCountDisplay.textContent = String(
+          Math.max(0, players.length - currentTotal),
+        );
     };
 
-    [assassinCountSelect, detectiveCountSelect, angelCountSelect].forEach((input) => {
-      if (input) input.onchange = updateRoleCount;
-    });
+    [assassinCountSelect, detectiveCountSelect, angelCountSelect].forEach(
+      (input) => {
+        if (input) input.onchange = updateRoleCount;
+      },
+    );
     updateRoleCount();
 
     const updateClueLimit = () => {
@@ -2736,9 +2759,15 @@ function renderLobby() {
         .filter((c) => c.checked)
         .map((c) => c.value);
       const roleCountsToSave = {
-        assassino: assassinCountSelect ? Number(assassinCountSelect.value) : roleCounts.assassino,
-        detetive: detectiveCountSelect ? Number(detectiveCountSelect.value) : roleCounts.detetive,
-        anjo: angelCountSelect ? Number(angelCountSelect.value) : roleCounts.anjo,
+        assassino: assassinCountSelect
+          ? Number(assassinCountSelect.value)
+          : roleCounts.assassino,
+        detetive: detectiveCountSelect
+          ? Number(detectiveCountSelect.value)
+          : roleCounts.detetive,
+        anjo: angelCountSelect
+          ? Number(angelCountSelect.value)
+          : roleCounts.anjo,
       };
       const ok = await updateRoomSettings(
         discussionSelect.value,
