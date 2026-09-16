@@ -31,10 +31,13 @@ function metaFromRow(row) {
     winner: row.winner,
     discussionSeconds: row.discussion_seconds || 60,
     votingSeconds: row.voting_seconds || 45,
-    phaseEndsAt: row.phase_ends_at
-      ? new Date(row.phase_ends_at).getTime()
-      : null,
+    phaseEndsAt: row.phase_ends_at ? new Date(row.phase_ends_at).getTime() : null,
     investigationGameId: row.investigation_game_id || null,
+    scenarioKey: row.scenario_key || "prefeitura",
+    traitCategories: Array.isArray(row.trait_categories) ? row.trait_categories : ["local", "objeto", "vestimenta"],
+    cluesPerRound: Number(row.clues_per_round) || 1,
+    revealOrder: Array.isArray(row.reveal_order) ? row.reveal_order : [],
+    revealedTraits: Array.isArray(row.revealed_traits) ? row.revealed_traits : [],
   };
 }
 function rowFromMeta(code, meta) {
@@ -50,10 +53,13 @@ function rowFromMeta(code, meta) {
     winner: meta.winner,
     discussion_seconds: meta.discussionSeconds,
     voting_seconds: meta.votingSeconds,
-    phase_ends_at: meta.phaseEndsAt
-      ? new Date(meta.phaseEndsAt).toISOString()
-      : null,
+    phase_ends_at: meta.phaseEndsAt ? new Date(meta.phaseEndsAt).toISOString() : null,
     investigation_game_id: meta.investigationGameId || null,
+    scenario_key: meta.scenarioKey || "prefeitura",
+    trait_categories: Array.isArray(meta.traitCategories) ? meta.traitCategories : ["local", "objeto", "vestimenta"],
+    clues_per_round: Number(meta.cluesPerRound) || 1,
+    reveal_order: Array.isArray(meta.revealOrder) ? meta.revealOrder : [],
+    revealed_traits: Array.isArray(meta.revealedTraits) ? meta.revealedTraits : [],
   };
 }
 async function dbGetRoom(code) {
@@ -88,6 +94,12 @@ async function dbUpsertPlayer(code, player) {
       alive: player.alive,
       role: player.role,
       ready_round: player.readyRound ?? 0,
+      trait_local: player.traitLocal || null,
+      trait_objeto: player.traitObjeto || null,
+      trait_vestimenta: player.traitVestimenta || null,
+      trait_intencao: player.traitIntencao || null,
+      trait_testemunha_axis: player.traitTestemunhaAxis || null,
+      trait_testemunha_value: player.traitTestemunhaValue || null,
     },
     { onConflict: "room_code,id" },
   );
@@ -115,6 +127,12 @@ async function dbFetchPlayers(code) {
     alive: r.alive,
     role: r.role,
     readyRound: r.ready_round ?? 0,
+    traitLocal: r.trait_local || null,
+    traitObjeto: r.trait_objeto || null,
+    traitVestimenta: r.trait_vestimenta || null,
+    traitIntencao: r.trait_intencao || null,
+    traitTestemunhaAxis: r.trait_testemunha_axis || null,
+    traitTestemunhaValue: r.trait_testemunha_value || null,
     joinedAt: r.joined_at ? new Date(r.joined_at).getTime() : 0,
   }));
 }
@@ -159,15 +177,9 @@ async function tryAdvanceRoleReveal() {
   return true;
 }
 
-async function dbSubmitNightAction(code, round, role, playerId, targetId) {
+async function dbSubmitNightAction(code, round, role, playerId, targetId, targetAxis = null) {
   const { error } = await sb.from("night_actions").upsert(
-    {
-      room_code: code,
-      round,
-      role,
-      player_id: playerId,
-      target_id: targetId,
-    },
+    { room_code: code, round, role, player_id: playerId, target_id: targetId, target_axis: targetAxis },
     { onConflict: "room_code,round,role,player_id" },
   );
   if (error) console.error("dbSubmitNightAction", error);
@@ -175,7 +187,7 @@ async function dbSubmitNightAction(code, round, role, playerId, targetId) {
 async function dbGetNightActions(code, round, role) {
   const { data, error } = await sb
     .from("night_actions")
-    .select("player_id,target_id")
+    .select("player_id,target_id,target_axis")
     .eq("room_code", code)
     .eq("round", round)
     .eq("role", role);
@@ -183,7 +195,7 @@ async function dbGetNightActions(code, round, role) {
     console.error("dbGetNightActions", error);
     return [];
   }
-  return data.map((r) => ({ playerId: r.player_id, targetId: r.target_id }));
+  return data.map((r) => ({ playerId: r.player_id, targetId: r.target_id, targetAxis: r.target_axis || null }));
 }
 async function dbSubmitVote(code, round, voterId, targetId) {
   const { error } = await sb.from("votes").upsert(
@@ -227,523 +239,245 @@ async function dbGetMyVote(code, round, playerId) {
   return data?.target_id ?? null;
 }
 
-/* ============ investigation system ============ */
-async function dbEnsureInitialInvestigationFacts(game, players) {
-  if (!game?.id || Number(game.round) !== 1 || !players?.length) return;
+/* ============ trait investigation system ============ */
+const TRAIT_CATEGORIES = {
+  local: { label: "Local", description: "Onde estava" },
+  objeto: { label: "Objeto", description: "O que levava" },
+  vestimenta: { label: "Vestimenta", description: "O que vestia" },
+  intencao: { label: "Intenção", description: "O que pretendia fazer", flavor: true },
+  testemunha: { label: "Testemunha", description: "Viu alguém", flavor: true },
+};
 
-  const { data: facts, error: factsError } = await sb
-    .from("investigation_facts")
-    .select("id,text,audience")
-    .eq("scenario_id", game.scenario_id)
-    .eq("active", true)
-    .order("id");
+const DEDUCIBLE_AXES = ["local", "objeto", "vestimenta"];
+const INTENTIONS = [
+  "buscar algo",
+  "encontrar alguém",
+  "apenas passando por ali",
+  "fugir de alguma coisa",
+  "resolver um assunto",
+  "pegar um objeto esquecido",
+];
 
-  if (factsError) {
-    console.error("dbEnsureInitialInvestigationFacts.facts", factsError);
-    return;
-  }
+const SCENARIO_PRESETS = {
+  prefeitura: {
+    name: "Prefeitura",
+    description: "Prédios públicos, arquivos e a praça central.",
+    local: ["saguão da Prefeitura", "arquivo municipal", "praça em frente"],
+    objeto: ["chave do arquivo", "lanterna", "guarda-chuva"],
+    vestimenta: ["casaco cinza", "camisa branca", "boné escuro"],
+  },
+  cassino: {
+    name: "Cassino",
+    description: "Luzes, mesas de jogo e corredores reservados.",
+    local: ["salão principal", "corredor dos camarotes", "área externa"],
+    objeto: ["ficha dourada", "baralho", "isqueiro"],
+    vestimenta: ["terno escuro", "vestido vermelho", "camisa preta"],
+  },
+  praia: {
+    name: "Praia",
+    description: "Calçadão, quiosques e areia à noite.",
+    local: ["calçadão", "quiosque", "faixa de areia"],
+    objeto: ["lanterna", "chave de armário", "mochila"],
+    vestimenta: ["casaco leve", "camiseta clara", "boné azul"],
+  },
+  festa: {
+    name: "Festa",
+    description: "Música, salão e áreas de serviço movimentadas.",
+    local: ["salão da festa", "área dos bastidores", "pátio externo"],
+    objeto: ["copo descartável", "chave do depósito", "pulseira da festa"],
+    vestimenta: ["jaqueta jeans", "camisa estampada", "vestido preto"],
+  },
+};
 
-  for (const player of players.filter((p) =>
-    ["cidadao", "anjo", "assassino"].includes(p.role),
-  )) {
-    const { data: existing, error: existingError } = await sb
-      .from("game_investigation_items")
-      .select("source_id")
-      .eq("game_id", game.id)
-      .eq("player_id", player.id)
-      .eq("item_type", "fact");
+function normalizeTraitCategories(value) {
+  const input = Array.isArray(value) ? value : ["local", "objeto", "vestimenta"];
+  const allowed = Object.keys(TRAIT_CATEGORIES);
+  const result = [...new Set(input.filter((x) => allowed.includes(x)))];
+  const axes = result.filter((x) => DEDUCIBLE_AXES.includes(x));
+  if (!axes.length) result.unshift("local");
+  return [...new Set(result)];
+}
 
-    if (existingError) {
-      console.error(
-        "dbEnsureInitialInvestigationFacts.existing",
-        existingError,
-      );
-      continue;
-    }
+function getScenarioPreset(key) {
+  return SCENARIO_PRESETS[key] || SCENARIO_PRESETS.prefeitura;
+}
 
-    const used = new Set((existing || []).map((item) => item.source_id));
-    const missing = Math.max(0, 3 - used.size);
-    if (!missing) continue;
+function getActiveAxes(meta) {
+  return normalizeTraitCategories(meta?.traitCategories).filter((x) => DEDUCIBLE_AXES.includes(x));
+}
 
-    // Primeiro usa os 3 fatos específicos do papel. O fato "todos" é reserva.
-    // O último fallback evita deixar o jogador sem fatos caso o seed tenha
-    // sido alterado ou algum fato específico esteja faltando.
-    const candidates = shuffle([
-      ...(facts || []).filter(
-        (f) => f.audience === player.role && !used.has(f.id),
-      ),
-      ...(facts || []).filter((f) => f.audience === "todos" && !used.has(f.id)),
-      ...(facts || []).filter((f) => !used.has(f.id)),
-    ]);
+function traitValue(player, axis) {
+  if (!player) return null;
+  return player[`trait${axis.charAt(0).toUpperCase()}${axis.slice(1)}`] || null;
+}
 
-    const rows = [];
-    for (const fact of candidates) {
-      if (used.has(fact.id)) continue;
-      rows.push({
-        game_id: game.id,
-        player_id: player.id,
-        role: player.role,
-        item_type: "fact",
-        source_id: fact.id,
-        text_snapshot: fact.text,
-        is_true: true,
-        sort_order: used.size + rows.length + 1,
-      });
-      used.add(fact.id);
-      if (rows.length >= missing) break;
-    }
+function traitField(axis) {
+  return `trait_${axis}`;
+}
 
-    if (rows.length) {
-      const { error: insertError } = await sb
-        .from("game_investigation_items")
-        .insert(rows);
-      if (insertError) {
-        console.error("dbEnsureInitialInvestigationFacts.insert", insertError);
-      }
-    }
+function randomTraitValue(preset, axis) {
+  const values = preset[axis] || [];
+  return values[Math.floor(Math.random() * values.length)] || null;
+}
+
+function ensureNoSingletonValues(players, preset, axis) {
+  const values = players.map((p) => traitValue(p, axis)).filter(Boolean);
+  const counts = {};
+  values.forEach((v) => (counts[v] = (counts[v] || 0) + 1));
+  const singletons = players.filter((p) => counts[traitValue(p, axis)] === 1);
+  for (const player of singletons) {
+    const candidates = Object.entries(counts)
+      .filter(([value, count]) => count >= 2 && value !== traitValue(player, axis))
+      .sort((a, b) => b[1] - a[1]);
+    const replacement = candidates[0]?.[0] || randomTraitValue(preset, axis);
+    const old = traitValue(player, axis);
+    if (old && counts[old]) counts[old]--;
+    player[traitField(axis)] = replacement;
+    counts[replacement] = (counts[replacement] || 0) + 1;
   }
 }
 
-async function dbCreateInvestigationGame(code, round, players) {
-  // A história deve permanecer a mesma durante todas as rodadas da partida.
-  // Só as informações distribuídas mudam a cada rodada.
-  const { data: previousGame, error: previousError } = await sb
-    .from("game_investigations")
-    .select("id,scenario_id")
-    .eq("room_code", code)
-    .eq("status", "active")
-    .order("round", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+function hasSameActiveCombination(a, b, axes) {
+  return axes.length > 0 && axes.every((axis) => traitValue(a, axis) === traitValue(b, axis));
+}
 
-  let chosen = null;
+async function dbAssignTraits(code, players, meta) {
+  const preset = getScenarioPreset(meta.scenarioKey);
+  const axes = getActiveAxes(meta);
+  const enriched = players.map((p) => ({ ...p }));
 
-  if (previousError) {
-    console.error("dbCreateInvestigationGame.previous", previousError);
-    return null;
+  for (const p of enriched) {
+    for (const axis of axes) p[traitField(axis)] = randomTraitValue(preset, axis);
+    if (meta.traitCategories.includes("intencao")) {
+      p.traitIntencao = INTENTIONS[Math.floor(Math.random() * INTENTIONS.length)];
+    } else p.traitIntencao = null;
+    p.traitTestemunhaAxis = null;
+    p.traitTestemunhaValue = null;
   }
 
-  if (previousGame?.scenario_id) {
-    const { data: previousScenario, error: previousScenarioError } = await sb
-      .from("investigation_scenarios")
-      .select("id,title,description,truth_summary")
-      .eq("id", previousGame.scenario_id)
-      .maybeSingle();
-    if (previousScenarioError || !previousScenario) {
-      console.error(
-        "dbCreateInvestigationGame.previousScenario",
-        previousScenarioError,
-      );
-      return null;
-    }
-    chosen = previousScenario;
-  } else {
-    const { data: scenarios, error: scenarioError } = await sb
-      .from("investigation_scenarios")
-      .select("id,title,description,truth_summary")
-      .eq("active", true)
-      .order("id", { ascending: false });
-    if (scenarioError || !scenarios?.length) {
-      console.error("dbCreateInvestigationGame.scenarios", scenarioError);
-      return null;
-    }
-    chosen = scenarios[Math.floor(Math.random() * scenarios.length)];
-  }
+  for (const axis of axes) ensureNoSingletonValues(enriched, preset, axis);
 
-  // A criação da investigação pode ser disparada por mais de um navegador
-  // ao mesmo tempo. O banco possui uma restrição única por sala/rodada para
-  // impedir que a mesma rodada receba duas pistas novas por uma corrida.
-  const { data: game, error: gameError } = await sb
-    .from("game_investigations")
-    .insert({
-      room_code: code,
-      round,
-      scenario_id: chosen.id,
-      status: "active",
-    })
-    .select("id,room_code,round,scenario_id")
-    .single();
-
-  if (gameError || !game) {
-    // Se outro navegador acabou de criar esta rodada, reutilizamos aquela
-    // investigação em vez de criar uma segunda e adicionar outra pista.
-    if (gameError?.code === "23505") {
-      const { data: existingGame, error: existingGameError } = await sb
-        .from("game_investigations")
-        .select("id,room_code,round,scenario_id")
-        .eq("room_code", code)
-        .eq("round", round)
-        .eq("status", "active")
-        .order("id", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (!existingGameError && existingGame) {
-        // A investigação pode já ter sido criada por outro navegador. Mesmo
-        // assim, não retornamos imediatamente: garantimos que os fatos dos
-        // jogadores desta partida estejam gravados. Isso corrige partidas em
-        // que a investigação existia, mas a distribuição dos fatos ficou
-        // incompleta.
-        await dbEnsureInitialInvestigationFacts(existingGame, players);
-        return existingGame;
+  const assassin = enriched.find((p) => p.role === "assassino");
+  if (assassin && axes.length) {
+    for (const p of enriched) {
+      if (p.id === assassin.id) continue;
+      if (hasSameActiveCombination(p, assassin, axes)) {
+        const axis = axes[Math.floor(Math.random() * axes.length)];
+        const choices = (preset[axis] || []).filter((v) => v !== traitValue(assassin, axis));
+        p[traitField(axis)] = choices[Math.floor(Math.random() * choices.length)] || randomTraitValue(preset, axis);
       }
     }
+  }
 
-    console.error("dbCreateInvestigationGame.game", gameError);
+  if (meta.traitCategories.includes("testemunha")) {
+    const alive = enriched.filter((p) => p.alive);
+    const count = Math.max(1, Math.round(alive.length * 0.3));
+    shuffle(alive).slice(0, count).forEach((witness) => {
+      const axis = axes[Math.floor(Math.random() * axes.length)];
+      const others = alive.filter((p) => p.id !== witness.id);
+      const seen = others[Math.floor(Math.random() * others.length)];
+      if (axis && seen) {
+        witness.traitTestemunhaAxis = axis;
+        witness.traitTestemunhaValue = traitValue(seen, axis);
+      }
+    });
+  }
+
+  const updates = enriched.map((p) => ({
+    room_code: code,
+    id: p.id,
+    name: p.name,
+    alive: p.alive,
+    role: p.role,
+    ready_round: 0,
+    trait_local: p.traitLocal || null,
+    trait_objeto: p.traitObjeto || null,
+    trait_vestimenta: p.traitVestimenta || null,
+    trait_intencao: p.traitIntencao || null,
+    trait_testemunha_axis: p.traitTestemunhaAxis || null,
+    trait_testemunha_value: p.traitTestemunhaValue || null,
+  }));
+  const { error } = await sb.from("players").upsert(updates, { onConflict: "room_code,id" });
+  if (error) {
+    console.error("dbAssignTraits", error);
     return null;
   }
+  return enriched;
+}
 
-  const { data: facts, error: factsError } = await sb
-    .from("investigation_facts")
-    .select("id,text,category,value,audience")
-    .eq("scenario_id", chosen.id)
-    .eq("active", true)
-    .order("id");
+async function dbRevealNextTraits(code, meta, players) {
+  const axes = getActiveAxes(meta);
+  const revealed = Array.isArray(meta.revealedTraits) ? meta.revealedTraits.slice() : [];
+  const order = Array.isArray(meta.revealOrder) && meta.revealOrder.length ? meta.revealOrder.slice() : shuffle(axes);
+  const revealedAxes = new Set(revealed.map((x) => x.axis));
+  const assassin = (players || []).find((p) => p.alive && p.role === "assassino");
+  if (!assassin) return meta;
 
-  // O Detetive recebe UMA pista nova por rodada. As pistas anteriores ficam
-  // preservadas e serão mostradas junto com a nova nas rodadas seguintes.
-  const { data: previousClueItems, error: previousClueError } = await sb
-    .from("game_investigations")
-    .select("id")
-    .eq("room_code", code)
-    .eq("status", "active");
-  if (previousClueError) {
-    console.error("dbCreateInvestigationGame.previousGames", previousClueError);
-    return null;
-  }
-
-  const previousGameIds = (previousClueItems || []).map((g) => g.id);
-  let usedClueIds = [];
-  if (previousGameIds.length) {
-    const { data: usedClues, error: usedCluesError } = await sb
-      .from("game_investigation_items")
-      .select("source_id")
-      .in("game_id", previousGameIds)
-      .eq("item_type", "clue");
-    if (usedCluesError) {
-      console.error("dbCreateInvestigationGame.usedClues", usedCluesError);
-      return null;
+  let added = 0;
+  const max = Math.min(Number(meta.cluesPerRound) || 1, axes.length);
+  const queue = order.slice();
+  const fallback = [];
+  while (queue.length && added < max) {
+    const axis = queue.shift();
+    if (revealedAxes.has(axis)) continue;
+    const value = traitValue(assassin, axis);
+    const aliveCount = (players || []).filter((p) => p.alive && traitValue(p, axis) === value).length;
+    if (aliveCount < 3) {
+      fallback.push(axis);
+      continue;
     }
-    usedClueIds = (usedClues || []).map((item) => item.source_id);
+    revealed.push({ axis, value });
+    revealedAxes.add(axis);
+    added++;
   }
-
-  const { data: availableClues, error: cluesError } = await sb
-    .from("investigation_clues")
-    .select("id,text,category,value,is_true")
-    .eq("scenario_id", chosen.id)
-    .eq("active", true)
-    .order("id");
-
-  if (factsError || cluesError) {
-    console.error("dbCreateInvestigationGame.items", factsError || cluesError);
-    return null;
+  while (added < max && fallback.length) {
+    const axis = fallback.shift();
+    if (revealedAxes.has(axis)) continue;
+    revealed.push({ axis, value: traitValue(assassin, axis) });
+    revealedAxes.add(axis);
+    added++;
   }
+  if (!added) return meta;
 
-  const unusedClues = (availableClues || []).filter(
-    (c) => !usedClueIds.includes(c.id),
-  );
-  const cluePool = unusedClues.length ? unusedClues : availableClues || [];
-  if (!cluePool.length) {
-    console.error("Pistas insuficientes para o cenário", chosen.id);
-    return null;
+  const log = Array.isArray(meta.log) ? meta.log.slice() : [];
+  const addedNow = revealed.slice(-added);
+  addedNow.forEach(({ axis, value }) => {
+    const label = TRAIT_CATEGORIES[axis]?.label || axis;
+    const line = `Descobriu-se que o assassino estava com ${label.toLowerCase()}: ${value}.`;
+    if (!log.includes(line)) log.push(line);
+  });
+  const nextMeta = { ...meta, revealOrder: queue.concat(fallback), revealedTraits: revealed, log };
+  const { error } = await sb
+    .from("rooms")
+    .update({ reveal_order: nextMeta.revealOrder, revealed_traits: revealed, log })
+    .eq("code", code)
+    .eq("phase", "day_reveal");
+  if (error) {
+    console.error("dbRevealNextTraits", error);
+    return meta;
   }
-
-  const assignments = [];
-
-  // Rodada 1: todos recebem suas informações iniciais.
-  // Rodadas seguintes: somente o Detetive recebe UMA pista nova.
-  if (Number(round) === 1) {
-    const trueClues = cluePool.filter((c) => c.is_true);
-    const falseClues = cluePool.filter((c) => !c.is_true);
-    if (trueClues.length < 1 || falseClues.length < 2) {
-      console.error(
-        "O cenário precisa ter pelo menos 1 pista verdadeira e 2 falsas.",
-        chosen.id,
-      );
-      await sb.from("game_investigations").delete().eq("id", game.id);
-      return null;
-    }
-
-    const initialClues = [
-      shuffle(trueClues)[0],
-      ...shuffle(falseClues).slice(0, 2),
-    ];
-
-    const factsByAudience = {
-      cidadao: shuffle(
-        (facts || []).filter(
-          (f) => f.audience === "cidadao" || f.audience === "todos",
-        ),
-      ),
-      anjo: shuffle(
-        (facts || []).filter(
-          (f) => f.audience === "anjo" || f.audience === "todos",
-        ),
-      ),
-      assassino: shuffle(
-        (facts || []).filter(
-          (f) => f.audience === "assassino" || f.audience === "todos",
-        ),
-      ),
-    };
-    if (
-      factsByAudience.cidadao.length < 3 ||
-      factsByAudience.anjo.length < 3 ||
-      factsByAudience.assassino.length < 3
-    ) {
-      console.error("Fatos insuficientes por papel para o cenário", chosen.id);
-      await sb.from("game_investigations").delete().eq("id", game.id);
-      return null;
-    }
-
-    const addFactsForPlayers = (role, list) => {
-      players
-        .filter((p) => p.role === role)
-        .forEach((player) => {
-          shuffle(list.slice())
-            .slice(0, 3)
-            .forEach((f, i) =>
-              assignments.push({
-                game_id: game.id,
-                player_id: player.id,
-                role: player.role,
-                item_type: "fact",
-                source_id: f.id,
-                text_snapshot: f.text,
-                is_true: true,
-                sort_order: i + 1,
-              }),
-            );
-        });
-    };
-    addFactsForPlayers("cidadao", factsByAudience.cidadao);
-    addFactsForPlayers("anjo", factsByAudience.anjo);
-    addFactsForPlayers("assassino", factsByAudience.assassino);
-
-    const detective = players.find((p) => p.role === "detetive");
-    if (detective) {
-      initialClues.forEach((clue, i) =>
-        assignments.push({
-          game_id: game.id,
-          player_id: detective.id,
-          role: detective.role,
-          item_type: "clue",
-          source_id: clue.id,
-          text_snapshot: clue.text,
-          is_true: clue.is_true,
-          sort_order: i + 1,
-        }),
-      );
-    }
-  } else {
-    const detective = players.find((p) => p.role === "detetive");
-    if (detective) {
-      const newDetectiveClue = shuffle(cluePool)[0];
-      assignments.push({
-        game_id: game.id,
-        player_id: detective.id,
-        role: detective.role,
-        item_type: "clue",
-        source_id: newDetectiveClue.id,
-        text_snapshot: newDetectiveClue.text,
-        is_true: newDetectiveClue.is_true,
-        sort_order: Number(round),
-      });
-    }
-  }
-
-  const { error: assignmentError } = await sb
-    .from("game_investigation_items")
-    .insert(assignments);
-  if (assignmentError) {
-    console.error("dbCreateInvestigationGame.assignments", assignmentError);
-    await sb.from("game_investigations").delete().eq("id", game.id);
-    return null;
-  }
-
-  // Garantia de integridade: cada jogador que não é Detetive deve ter
-  // exatamente 3 fatos na primeira rodada. Isso também repara uma criação
-  // parcial sem depender de qual navegador iniciou a partida.
-  await dbEnsureInitialInvestigationFacts(game, players);
-
-  return game;
+  return nextMeta;
 }
 
 async function dbGetMyInvestigationItems(gameId, playerId, playerRole) {
-  if (!gameId || !playerId) {
-    console.warn("dbGetMyInvestigationItems: gameId ou playerId ausente", {
-      gameId,
-      playerId,
-    });
-    return [];
-  }
-
-  const { data: currentGame, error: currentGameError } = await sb
-    .from("game_investigations")
-    .select("id,room_code,round")
-    .eq("id", gameId)
-    .maybeSingle();
-
-  if (currentGameError || !currentGame) {
-    console.error("dbGetMyInvestigationItems.game", {
-      error: currentGameError,
-      gameId,
-      playerId,
-    });
-    return [];
-  }
-
-  // O jogador já foi carregado pelo refreshOnce().
-  // Não fazemos uma segunda consulta em players, pois o mesmo playerId pode
-  // aparecer em mais de um registro legado da sala e o maybeSingle() geraria
-  // PGRST116. O papel recebido aqui é o mesmo usado na tela.
-  const me = { id: playerId, role: playerRole };
-
-  if (!me.role) {
-    console.warn("dbGetMyInvestigationItems: papel do jogador ausente", {
-      playerId,
-      gameId,
-    });
-    return [];
-  }
-
-  /*
-   * DETETIVE
-   *
-   * O detetive acumula todas as pistas das rodadas.
-   */
-  if (me.role === "detetive") {
-    const { data: games, error: gamesError } = await sb
-      .from("game_investigations")
-      .select("id,round")
-      .eq("room_code", currentGame.room_code)
-      .eq("status", "active")
-      .order("round", { ascending: true });
-
-    if (gamesError) {
-      console.error("dbGetMyInvestigationItems.games", gamesError);
-      return [];
-    }
-
-    const gameIds = (games || []).map((game) => game.id);
-
-    if (!gameIds.length) {
-      console.warn(
-        "dbGetMyInvestigationItems: nenhuma investigação encontrada",
-        {
-          roomCode: currentGame.room_code,
-        },
-      );
-      return [];
-    }
-
-    const { data, error } = await sb
-      .from("game_investigation_items")
-      .select("id,item_type,text_snapshot,is_true,sort_order,game_id")
-      .in("game_id", gameIds)
-      .eq("player_id", playerId)
-      .eq("item_type", "clue")
-      .order("created_at", { ascending: true });
-
-    if (error) {
-      console.error("dbGetMyInvestigationItems.detective", {
-        error,
-        gameIds,
-        playerId,
-      });
-      return [];
-    }
-
-    console.log("Pistas do detetive carregadas:", data);
-
-    return data || [];
-  }
-
-  /*
-   * CIDADÃO / ANJO / ASSASSINO
-   *
-   * Os 3 fatos são distribuídos somente na rodada 1, mas precisam continuar
-   * visíveis nas telas de revelação das rodadas seguintes. Por isso, não
-   * buscamos mais pelo gameId atual (rodada 2, 3, ...), e sim em todas as
-   * investigações ATIVAS da partida. Como somente a rodada 1 possui fatos,
-   * o jogador recebe sempre os mesmos 3 fatos.
-   */
-  const { data: activeGames, error: activeGamesError } = await sb
-    .from("game_investigations")
-    .select("id,round")
-    .eq("room_code", currentGame.room_code)
-    .eq("status", "active")
-    .order("round", { ascending: true });
-
-  if (activeGamesError) {
-    console.error("dbGetMyInvestigationItems.factGames", activeGamesError);
-    return [];
-  }
-
-  const activeGameIds = (activeGames || []).map((game) => game.id);
-  if (!activeGameIds.length) return [];
-
-  const { data, error } = await sb
-    .from("game_investigation_items")
-    .select("id,item_type,text_snapshot,is_true,sort_order,game_id")
-    .in("game_id", activeGameIds)
-    .eq("player_id", playerId)
-    .eq("item_type", "fact")
-    .order("sort_order", { ascending: true });
-
-  if (error) {
-    console.error("dbGetMyInvestigationItems.fact", {
-      error,
-      gameId,
-      playerId,
-      role: me.role,
-    });
-    return [];
-  }
-
-  console.log("Fatos do jogador carregados:", {
-    playerId,
-    role: me.role,
-    gameId,
-    items: data,
+  if (!state.roomCode || !playerId) return [];
+  const player = (state.players || []).find((p) => p.id === playerId);
+  if (!player) return [];
+  const meta = state.room;
+  const axes = getActiveAxes(meta);
+  const items = [];
+  axes.forEach((axis) => {
+    const value = traitValue(player, axis);
+    if (value) items.push({ item_type: "trait", axis, text_snapshot: `${TRAIT_CATEGORIES[axis].description}: ${value}` });
   });
-
-  return data || [];
-}
-
-async function dbGetInvestigationTruth(gameId) {
-  if (!gameId) return null;
-  const { data: game, error: gameError } = await sb
-    .from("game_investigations")
-    .select("id,scenario_id,truth_revealed_at")
-    .eq("id", gameId)
-    .maybeSingle();
-  if (gameError || !game) return null;
-  const { data: scenario, error: scenarioError } = await sb
-    .from("investigation_scenarios")
-    .select("id,title,description,truth_summary")
-    .eq("id", game.scenario_id)
-    .maybeSingle();
-  const { data: facts, error: factsError } = await sb
-    .from("investigation_facts")
-    .select("id,text,category,value")
-    .eq("scenario_id", game.scenario_id)
-    .eq("active", true)
-    .order("id");
-  if (scenarioError || factsError || !scenario) return null;
-  return { ...game, scenario, facts: facts || [] };
-}
-
-async function dbMarkInvestigationFinished(gameId) {
-  if (!gameId) return;
-  const { error } = await sb
-    .from("game_investigations")
-    .update({
-      status: "finished",
-      truth_revealed_at: new Date().toISOString(),
-    })
-    .eq("id", gameId);
-  if (error) console.error("dbMarkInvestigationFinished", error);
+  if (meta?.traitCategories?.includes("intencao") && player.traitIntencao) {
+    items.push({ item_type: "trait", axis: "intencao", text_snapshot: `Intenção: ${player.traitIntencao}` });
+  }
+  if (meta?.traitCategories?.includes("testemunha") && player.traitTestemunhaAxis && player.traitTestemunhaValue) {
+    const label = TRAIT_CATEGORIES[player.traitTestemunhaAxis]?.description || player.traitTestemunhaAxis;
+    items.push({ item_type: "trait", axis: "testemunha", text_snapshot: `Você viu alguém ${player.traitTestemunhaValue} (${label.toLowerCase()}).` });
+  }
+  return items;
 }
 
 /* ============ helpers: misc ============ */
@@ -913,6 +647,7 @@ const state = {
   error: "",
   busy: false,
   selectedTarget: null,
+  selectedAxis: null,
   voteConfirmed: false,
   nightActionConfirmed: false,
   pollHandle: null,
@@ -962,6 +697,11 @@ async function createRoom(name) {
     votingSeconds: 45,
     phaseEndsAt: null,
     investigationGameId: null,
+    scenarioKey: "prefeitura",
+    traitCategories: ["local", "objeto", "vestimenta"],
+    cluesPerRound: 1,
+    revealOrder: [],
+    revealedTraits: [],
   };
   await dbCreateRoom(code, meta);
   await dbUpsertPlayer(code, {
@@ -977,21 +717,17 @@ async function createRoom(name) {
   enterLobby();
 }
 
-async function updateRoomSettings(discussionSeconds, votingSeconds) {
-  if (!state.isHost || !state.roomCode || state.room?.status !== "lobby")
-    return;
-
+async function updateRoomSettings(discussionSeconds, votingSeconds, scenarioKey, traitCategories, cluesPerRound) {
+  if (!state.isHost || !state.roomCode || state.room?.status !== "lobby") return;
   const meta = await dbGetRoom(state.roomCode);
   if (!meta || meta.status !== "lobby") return;
-
   meta.discussionSeconds = Number(discussionSeconds) || 90;
   meta.votingSeconds = Number(votingSeconds) || 30;
-
+  meta.scenarioKey = SCENARIO_PRESETS[scenarioKey] ? scenarioKey : "prefeitura";
+  meta.traitCategories = normalizeTraitCategories(traitCategories);
+  meta.cluesPerRound = Math.max(1, Math.min(Number(cluesPerRound) || 1, getActiveAxes(meta).length));
   await dbUpdateRoom(state.roomCode, meta);
   state.room = meta;
-  // Não renderiza novamente aqui. O render imediato recriava o <select>
-  // enquanto o navegador ainda estava abrindo o menu, fazendo o primeiro
-  // clique abrir e fechar. O Realtime já atualiza os demais clientes.
 }
 
 async function joinRoom(code, name) {
@@ -1070,22 +806,10 @@ async function refreshOnce() {
   state.room = meta;
   state.players = players;
 
-  if (meta.status === "active" && meta.investigationGameId) {
+  if (meta.status === "active") {
     const me = players.find((p) => p.id === state.playerId);
-    state.investigationItems = me
-      ? await dbGetMyInvestigationItems(
-          meta.investigationGameId,
-          me.id,
-          me.role,
-        )
-      : [];
-    if (meta.phase === "gameover") {
-      state.investigationCase = await dbGetInvestigationTruth(
-        meta.investigationGameId,
-      );
-    } else {
-      state.investigationCase = null;
-    }
+    state.investigationItems = me ? await dbGetMyInvestigationItems(meta.investigationGameId, me.id, me.role) : [];
+    state.investigationCase = null;
   } else {
     state.investigationItems = [];
     state.investigationCase = null;
@@ -1094,6 +818,7 @@ async function refreshOnce() {
   if (meta.status === "lobby" && state.screen === "game") {
     state.screen = "lobby";
     state.selectedTarget = null;
+    state.selectedAxis = null;
     state.voteConfirmed = false;
     state.nightActionConfirmed = false;
     state.lastPhaseSeen = null;
@@ -1102,6 +827,7 @@ async function refreshOnce() {
   } else if (meta.status === "active" && state.screen !== "game") {
     state.screen = "game";
     state.selectedTarget = null;
+    state.selectedAxis = null;
     state.voteConfirmed = false;
     state.nightActionConfirmed = false;
   }
@@ -1110,6 +836,7 @@ async function refreshOnce() {
 
   if (phaseChanged) {
     state.selectedTarget = null;
+    state.selectedAxis = null;
     state.voteConfirmed = false;
     state.nightActionConfirmed = false;
     state.lastPhaseSeen = meta.phase;
@@ -1140,6 +867,7 @@ async function refreshOnce() {
     const ownAction = rows.find((row) => row.playerId === state.playerId);
     if (ownAction) {
       state.selectedTarget = ownAction.targetId;
+      state.selectedAxis = ownAction.targetAxis || null;
       state.nightActionConfirmed = true;
     }
   }
@@ -1165,6 +893,10 @@ async function refreshOnce() {
     winner: meta.winner,
     discussionSeconds: meta.discussionSeconds,
     votingSeconds: meta.votingSeconds,
+    scenarioKey: meta.scenarioKey,
+    traitCategories: meta.traitCategories,
+    cluesPerRound: meta.cluesPerRound,
+    revealedTraits: meta.revealedTraits,
     players: players.map((p) => ({
       id: p.id,
       name: p.name,
@@ -1189,6 +921,14 @@ async function refreshOnce() {
   // enquanto o jogador lê ou interage com a tela.
   if (meta.phase === "role_reveal" && state.screen === "game") {
     updateReadyCountDisplay(players, meta.round);
+  }
+
+  if (meta.phase === "day_reveal" && state.isHost) {
+    const revealedMeta = await dbRevealNextTraits(state.roomCode, meta, players);
+    if (revealedMeta !== meta) {
+      state.room = revealedMeta;
+      return refresh();
+    }
   }
 
   if (
@@ -1394,7 +1134,17 @@ async function dbClearMatchActions(code) {
 async function dbResetPlayersForLobby(code) {
   const { error } = await sb
     .from("players")
-    .update({ alive: true, role: null, ready_round: 0 })
+    .update({
+      alive: true,
+      role: null,
+      ready_round: 0,
+      trait_local: null,
+      trait_objeto: null,
+      trait_vestimenta: null,
+      trait_intencao: null,
+      trait_testemunha_axis: null,
+      trait_testemunha_value: null,
+    })
     .eq("room_code", code);
 
   if (error) {
@@ -1582,32 +1332,24 @@ async function hostStartGame() {
     role: pool[idx],
     alive: true,
     readyRound: 0,
+    traitLocal: null,
+    traitObjeto: null,
+    traitVestimenta: null,
+    traitIntencao: null,
+    traitTestemunhaAxis: null,
+    traitTestemunhaValue: null,
   }));
-  // A rodada 1 de uma nova partida nunca deve reaproveitar uma investigação
-  // ativa de um teste/replay anterior. Finalizamos qualquer sobra antes de
-  // criar a investigação desta nova partida.
-  await sb
-    .from("game_investigations")
-    .update({
-      status: "finished",
-      truth_revealed_at: new Date().toISOString(),
-    })
-    .eq("room_code", state.roomCode)
-    .eq("status", "active");
 
-  const investigationGame = await dbCreateInvestigationGame(
-    state.roomCode,
-    meta.round,
-    assignedPlayers,
-  );
-  if (!investigationGame) {
+  meta.revealOrder = shuffle(getActiveAxes(meta));
+  meta.revealedTraits = [];
+  const traitPlayers = await dbAssignTraits(state.roomCode, assignedPlayers, meta);
+  if (!traitPlayers) {
     state.busy = false;
-    state.error =
-      "Não foi possível preparar a história e as pistas desta partida.";
+    state.error = "Não foi possível sortear os traços desta partida.";
     render();
     return;
   }
-  meta.investigationGameId = investigationGame.id;
+  meta.investigationGameId = null;
 
   await dbUpdateRoom(state.roomCode, meta);
 
@@ -1629,30 +1371,23 @@ function selectNightTarget(targetId) {
 
 async function confirmNightAction() {
   if (state.nightActionConfirmed || !state.selectedTarget) return;
-
   const me = myPlayer();
   if (!me || !me.alive) return;
-
   const validRoles = ["assassino", "anjo", "detetive"];
   if (!validRoles.includes(me.role)) return;
-
-  const target = (state.players || []).find(
-    (p) => p.id === state.selectedTarget,
-  );
-  if (!target || !target.alive || (target.id === me.id && me.role !== "anjo"))
-    return;
-
+  if (me.role === "detetive" && !state.selectedAxis) return;
+  const target = (state.players || []).find((p) => p.id === state.selectedTarget);
+  if (!target || !target.alive || (target.id === me.id && me.role !== "anjo")) return;
   await dbSubmitNightAction(
     state.roomCode,
     state.room.round,
     me.role,
     state.playerId,
     state.selectedTarget,
+    me.role === "detetive" ? state.selectedAxis : null,
   );
-
   state.nightActionConfirmed = true;
   render();
-
   await tryAutoResolveNight();
 }
 
@@ -1848,59 +1583,17 @@ function checkWinner(players) {
 async function advanceToNextNight() {
   const meta = await dbGetRoom(state.roomCode);
   if (!meta || meta.phase !== "day_results") return;
-
   const nextRound = (meta.round || 0) + 1;
   const nextLog = Array.isArray(meta.log) ? meta.log.slice() : [];
   const line = `A cidade se prepara para a rodada ${nextRound}.`;
   if (!nextLog.includes(line)) nextLog.push(line);
 
-  const players = await fetchPlayers(state.roomCode);
-  if (!players?.length) return;
-
-  // Primeiro preparamos a investigação completa da próxima rodada.
-  // Só depois trocamos a sala para role_reveal. Isso impede que os jogadores
-  // recebam a tela de revelação antes da nova pista do Detetive existir.
-  let investigationGame = null;
-  const { data: existingGame, error: existingError } = await sb
-    .from("game_investigations")
-    .select("id,room_code,round,scenario_id")
-    .eq("room_code", state.roomCode)
-    .eq("round", nextRound)
-    .eq("status", "active")
-    .order("id", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (existingError) {
-    console.error("advanceToNextNight.existingGame", existingError);
-    return;
-  }
-
-  if (existingGame) {
-    investigationGame = existingGame;
-  } else {
-    investigationGame = await dbCreateInvestigationGame(
-      state.roomCode,
-      nextRound,
-      players,
-    );
-  }
-
-  if (!investigationGame) {
-    console.error(
-      "advanceToNextNight: não foi possível criar a nova pista da rodada",
-    );
-    return;
-  }
-
-  // A troca de fase acontece somente quando a investigação já está pronta.
   const { data: updatedRoom, error } = await sb
     .from("rooms")
     .update({
       round: nextRound,
       phase: "role_reveal",
       phase_ends_at: null,
-      investigation_game_id: investigationGame.id,
       log: nextLog,
     })
     .eq("code", state.roomCode)
@@ -1912,7 +1605,6 @@ async function advanceToNextNight() {
     console.error("advanceToNextNight", error);
     return;
   }
-
   if (updatedRoom) await refresh();
 }
 
@@ -2100,6 +1792,8 @@ async function hostReplayRoom() {
     meta.lastEliminatedName = null;
     meta.phaseEndsAt = null;
     meta.investigationGameId = null;
+    meta.revealOrder = [];
+    meta.revealedTraits = [];
     meta.log = ["A sala foi reiniciada. Todos podem jogar novamente."];
     await dbUpdateRoom(state.roomCode, meta);
   }
@@ -2127,6 +1821,7 @@ function leaveToLanding() {
     error: "",
     busy: false,
     selectedTarget: null,
+    selectedAxis: null,
     voteConfirmed: false,
     nightActionConfirmed: false,
     lastPhaseSeen: null,
@@ -2387,7 +2082,28 @@ function renderLobby() {
             .join("")}
         </select>
       </div>
-      <p class="footnote">${state.isHost ? "Você pode mudar essas opções a qualquer momento antes de iniciar." : "Somente o anfitrião pode alterar os tempos."}</p>
+      <div class="field">
+        <label for="scenario-select">Cenário</label>
+        <select id="scenario-select" ${state.isHost ? "" : "disabled"}>
+          ${Object.entries(SCENARIO_PRESETS).map(([key, s]) => `<option value="${key}" ${state.room?.scenarioKey === key ? "selected" : ""}>${esc(s.name)}</option>`).join("")}
+        </select>
+        <p class="footnote">${esc(getScenarioPreset(state.room?.scenarioKey).description)}</p>
+      </div>
+
+      <div class="field">
+        <label>Informações ativas</label>
+        <div style="display:grid;gap:8px;margin-top:8px;">
+          ${Object.entries(TRAIT_CATEGORIES).map(([key, info]) => `<label style="display:flex;gap:8px;align-items:center;"><input type="checkbox" class="trait-category" value="${key}" ${normalizeTraitCategories(state.room?.traitCategories).includes(key) ? "checked" : ""} ${state.isHost ? "" : "disabled"}> <span>${esc(info.label)}</span></label>`).join("")}
+        </div>
+        <p class="footnote">Local, objeto e vestimenta são os eixos dedutíveis. Testemunha torna a informação mais forte; intenção é apenas narrativa.</p>
+      </div>
+
+      <div class="field">
+        <label for="clues-per-round">Traços revelados por rodada</label>
+        <input id="clues-per-round" type="number" min="1" max="${Math.max(1, getActiveAxes(state.room).length)}" value="${Math.min(Number(state.room?.cluesPerRound) || 1, Math.max(1, getActiveAxes(state.room).length))}" ${state.isHost ? "" : "disabled"}>
+      </div>
+
+      <p class="footnote">${state.isHost ? "Você pode mudar essas opções a qualquer momento antes de iniciar." : "Somente o anfitrião pode alterar as configurações."}</p>
     </div>
 
     <hr class="divider">
@@ -2422,13 +2138,25 @@ function renderLobby() {
 
   const discussionSelect = wrap.querySelector("#discussion-time");
   const votingSelect = wrap.querySelector("#voting-time");
+  const scenarioSelect = wrap.querySelector("#scenario-select");
+  const clueInput = wrap.querySelector("#clues-per-round");
+  const categoryChecks = [...wrap.querySelectorAll(".trait-category")];
   if (state.isHost) {
     const saveSettings = async () => {
       if (state.busy) return;
-      await updateRoomSettings(discussionSelect.value, votingSelect.value);
+      const selected = categoryChecks.filter((c) => c.checked).map((c) => c.value);
+      const axesCount = selected.filter((x) => DEDUCIBLE_AXES.includes(x)).length;
+      if (!axesCount) {
+        const local = categoryChecks.find((c) => c.value === "local");
+        if (local) local.checked = true;
+        selected.push("local");
+      }
+      const max = Math.max(1, selected.filter((x) => DEDUCIBLE_AXES.includes(x)).length);
+      clueInput.max = String(max);
+      if (Number(clueInput.value) > max) clueInput.value = String(max);
+      await updateRoomSettings(discussionSelect.value, votingSelect.value, scenarioSelect.value, selected, clueInput.value);
     };
-    discussionSelect.onchange = saveSettings;
-    votingSelect.onchange = saveSettings;
+    [discussionSelect, votingSelect, scenarioSelect, clueInput, ...categoryChecks].forEach((input) => { if (input) input.onchange = saveSettings; });
   }
 
   return wrap;
@@ -2611,37 +2339,8 @@ function renderNightTransition(meta) {
 function renderInvestigationItemsHtml(me, meta) {
   const items = state.investigationItems || [];
   if (!items.length) return "";
-
-  const isDetective = me.role === "detetive";
-  const laterRound = Number(meta?.round || 1) > 1;
-  const title = isDetective
-    ? "🔎 Suas pistas"
-    : me.role === "assassino"
-      ? "🔪 O que você sabe sobre sua noite"
-      : "📜 Seus fatos";
-
-  const lastGameItem =
-    isDetective && laterRound ? items[items.length - 1] : null;
-
-  return `<div class="investigation-private-info">
-    <div class="investigation-private-title">${title}</div>
-    <ol>${items
-      .map(
-        (item) => `
-      <li class="${lastGameItem && item.id === lastGameItem.id ? "new-investigation-item" : ""}">
-        ${lastGameItem && item.id === lastGameItem.id ? '<span class="new-item-badge">NOVA</span>' : ""}
-        ${esc(item.text_snapshot)}
-      </li>`,
-      )
-      .join("")}</ol>
-    ${
-      isDetective
-        ? laterRound
-          ? `<small class="new-clue-notice">🕵️ Uma nova pista foi adicionada nesta rodada. Ela pode ser verdadeira ou falsa.</small>`
-          : `<small>Uma das pistas é verdadeira e duas são falsas. Você não sabe qual.</small>`
-        : `<small>Essas informações fazem parte da história desta partida.</small>`
-    }
-  </div>`;
+  const title = me.role === "detetive" ? "🔎 Seus traços" : "📜 Suas informações";
+  return `<div class="investigation-private-info"><div class="investigation-private-title">${title}</div><ol>${items.map((item) => `<li>${esc(item.text_snapshot)}</li>`).join("")}</ol><small>Todos os traços mostrados são verdadeiros. A mentira só pode existir no que os jogadores contam.</small></div>`;
 }
 
 function updateReadyCountDisplay(players, round) {
@@ -2757,128 +2456,66 @@ function aliveOthers(playerId) {
 }
 
 function renderNightPanel(meta, me) {
-  const shouldAnimate =
-    state.nightEnteredAt && Date.now() - state.nightEnteredAt < 1400;
-  const card = el(
-    `<div class="card night-action-card${shouldAnimate ? " night-action-enter" : ""}"></div>`,
-  );
-
+  const shouldAnimate = state.nightEnteredAt && Date.now() - state.nightEnteredAt < 1400;
+  const card = el(`<div class="card night-action-card${shouldAnimate ? " night-action-enter" : ""}"></div>`);
   if (me.role === "cidadao") {
-    card.appendChild(
-      el(`<div class="night-role-header citizen-header">
-      ${roleAvatar("cidadao")}
-      <div><p class="eyebrow">NOITE — SUA VEZ DE OBSERVAR</p><h2>Você é o Cidadão</h2></div>
-    </div>`),
-    );
-    card.appendChild(
-      el(`<div class="waiting-role-panel">
-      ${roleActionIcon("cidadao", 58)}
-      <h3>A cidade dorme.</h3>
-      <p>Você não tem ação nesta noite. Observe em silêncio e guarde suas suspeitas para o dia.</p>
-    </div>`),
-    );
+    card.innerHTML = `${roleAvatar("cidadao")}<div><p class="eyebrow">NOITE — SUA VEZ DE OBSERVAR</p><h2>Você é o Cidadão</h2><p>Você não tem ação nesta noite. Observe em silêncio.</p></div>`;
     return card;
   }
-
-  if (!["assassino", "anjo", "detetive"].includes(me.role)) {
-    card.appendChild(
-      el(
-        `<div class="waiting-role-panel">${roleAvatar("cidadao", "role-avatar role-avatar-large")}<h3>Seu papel não possui ação nesta noite.</h3></div>`,
-      ),
-    );
-    return card;
-  }
-
   const headings = {
     assassino: ["Escolha uma vítima", "Escolha uma pessoa para eliminar."],
     anjo: ["Escolha quem proteger", "Escolha uma pessoa para proteger."],
-    detetive: [
-      "Escolha uma pessoa para investigar",
-      "O resultado será apenas um sinal de papel especial ou cidadão.",
-    ],
+    detetive: ["Escolha uma pessoa e um eixo", "Descubra o valor real de um traço dessa pessoa."],
   };
-
-  const [title, subtitle] = headings[me.role];
-  const targets =
-    me.role === "assassino"
-      ? aliveOthers(me.id).filter((p) => p.role !== "assassino")
-      : me.role === "detetive"
-        ? aliveOthers(me.id)
-        : (state.players || []).filter((p) => p.alive);
-
-  const box = el(`<div>
-    <div class="night-role-header">
-      ${roleAvatar(me.role)}
-      <div><p class="eyebrow">NOITE — SUA AÇÃO</p><h2>Você é o <strong>${esc(ROLE_INFO[me.role].name)}</strong></h2></div>
-    </div>
-    <div class="action-heading">
-      ${roleActionIcon(me.role, 52)}
-      <div><h3>${title}</h3><p>${subtitle}</p></div>
-    </div>
-    <div class="target-grid visual-target-grid" id="night-targets"></div>
-    <p class="footnote">Selecione uma pessoa. Depois confirme no botão de check.</p>
-  </div>`);
-
+  const [title, subtitle] = headings[me.role] || headings.cidadao;
+  const targets = me.role === "assassino" ? aliveOthers(me.id).filter((p) => p.role !== "assassino") : me.role === "detetive" ? aliveOthers(me.id) : (state.players || []).filter((p) => p.alive);
+  const box = el(`<div><div class="night-role-header">${roleAvatar(me.role)}<div><p class="eyebrow">NOITE — SUA AÇÃO</p><h2>Você é o <strong>${esc(ROLE_INFO[me.role].name)}</strong></h2></div></div><div class="action-heading">${roleActionIcon(me.role, 52)}<div><h3>${title}</h3><p>${subtitle}</p></div></div><div class="target-grid visual-target-grid" id="night-targets"></div></div>`);
   const grid = box.querySelector("#night-targets");
   targets.forEach((t) => {
     const row = el(`<div class="action-target-row visual-target-row"></div>`);
-    const button = el(
-      `<button class="target-btn action-target-button visual-target-button"></button>`,
-    );
-    button.innerHTML = `${playerAvatar(t.name)}<span>${esc(t.name)}${t.id === me.id ? " <small>(você)</small>" : ""}</span>`;
+    const button = el(`<button class="target-btn action-target-button visual-target-button"></button>`);
+    button.innerHTML = `${playerAvatar(t.name)}<span>${esc(t.name)}</span>`;
     if (state.selectedTarget === t.id) button.classList.add("selected");
     button.disabled = state.nightActionConfirmed;
-    button.onclick = () => selectNightTarget(t.id);
+    button.onclick = () => { state.selectedTarget = t.id; if (me.role !== "detetive") state.selectedAxis = null; render(); };
     row.appendChild(button);
-
     if (state.selectedTarget === t.id && !state.nightActionConfirmed) {
-      const confirm = el(
-        `<button class="action-confirm-btn" title="Confirmar ação" aria-label="Confirmar ação">✓</button>`,
-      );
-      confirm.onclick = confirmNightAction;
-      row.appendChild(confirm);
+      if (me.role === "detetive") {
+        const axisBox = el(`<div class="trait-axis-picker"><p class="footnote">O que investigar?</p><div class="target-grid" id="axis-options"></div></div>`);
+        const axisGrid = axisBox.querySelector("#axis-options");
+        getActiveAxes(meta).forEach((axis) => {
+          const b = el(`<button class="target-btn ${state.selectedAxis === axis ? "selected" : ""}"><span>${esc(TRAIT_CATEGORIES[axis].label)}</span></button>`);
+          b.onclick = () => { state.selectedAxis = axis; render(); };
+          axisGrid.appendChild(b);
+        });
+        row.appendChild(axisBox);
+      }
+      if (me.role !== "detetive" || state.selectedAxis) {
+        const confirm = el(`<button class="action-confirm-btn" title="Confirmar ação" aria-label="Confirmar ação">✓</button>`);
+        confirm.onclick = confirmNightAction;
+        row.appendChild(confirm);
+      }
     }
     grid.appendChild(row);
   });
-
   if (state.nightActionConfirmed) {
     if (me.role === "detetive") {
       const chosen = targets.find((t) => t.id === state.selectedTarget);
-      if (chosen) {
-        const special = chosen.role === "assassino" || chosen.role === "anjo";
-        box.appendChild(
-          el(`<div class="investigation-result ${special ? "positive" : "negative"}">
-          <span class="investigation-symbol">${special ? "✓" : "×"}</span>
-          <div><strong>${special ? "Papel especial" : "Cidadão"}</strong><p>Investigação concluída.</p></div>
-        </div>`),
-        );
-      }
-    } else {
-      box.appendChild(
-        el(
-          `<div class="action-confirmed"><span class="confirm-check">✓</span><span>Ação confirmada.</span></div>`,
-        ),
-      );
-    }
-    box.appendChild(
-      el(
-        `<p class="footnote">Sua ação já foi registrada e não pode ser alterada nesta noite.</p>`,
-      ),
-    );
+      const value = chosen ? traitValue(chosen, state.selectedAxis) : null;
+      const label = TRAIT_CATEGORIES[state.selectedAxis]?.description || "Traço";
+      if (chosen && value) box.appendChild(el(`<div class="investigation-result positive"><span class="investigation-symbol">✓</span><div><strong>${esc(chosen.name)} — ${esc(label)}</strong><p>${esc(value)}</p></div></div>`));
+    } else box.appendChild(el(`<div class="action-confirmed"><span class="confirm-check">✓</span><span>Ação confirmada.</span></div>`));
   }
-
   card.appendChild(box);
   return card;
 }
 
 function renderDayReveal(meta, me) {
-  const card = el(`<div class="card day-event-card">
-    <div class="event-icon death-icon">${meta.lastDeathName ? skullSvg(58) : sunriseSvg(58)}</div>
-    <p class="eyebrow">AO AMANHECER</p>
-    <h2>${meta.lastDeathName ? `${esc(meta.lastDeathName)} não sobreviveu à noite.` : "Ninguém morreu esta noite."}</h2>
-    <p class="tagline">A cidade terá alguns segundos para absorver o que aconteceu.</p>
-    <div class="phase-mini-timer" id="day-reveal-timer">00:07</div>
-  </div>`);
+  const revealed = Array.isArray(meta.revealedTraits) ? meta.revealedTraits : [];
+  const last = revealed[revealed.length - 1];
+  const label = last ? TRAIT_CATEGORIES[last.axis]?.label || last.axis : null;
+  const message = last ? `Descobriu-se que o assassino estava com ${label.toLowerCase()}: ${last.value}.` : (meta.lastDeathName ? `${esc(meta.lastDeathName)} não sobreviveu à noite.` : "Ninguém morreu esta noite.");
+  const card = el(`<div class="card day-event-card"><div class="event-icon death-icon">${meta.lastDeathName ? skullSvg(58) : sunriseSvg(58)}</div><p class="eyebrow">AO AMANHECER</p><h2>${message}</h2><p class="tagline">A cidade terá alguns segundos para absorver o que aconteceu.</p><div class="phase-mini-timer" id="day-reveal-timer">00:07</div></div>`);
   attachCountdown(card.querySelector("#day-reveal-timer"), meta);
   return card;
 }
@@ -2886,17 +2523,7 @@ function renderDayReveal(meta, me) {
 function renderInvestigationPanelHtml(me) {
   const items = state.investigationItems || [];
   if (!items.length) return "";
-  const title =
-    me.role === "detetive"
-      ? "🔎 Suas pistas"
-      : me.role === "assassino"
-        ? "🔪 O que você sabe"
-        : "📜 Seus fatos";
-  const note =
-    me.role === "detetive"
-      ? "Uma é verdadeira e duas são falsas. O sistema não revela qual."
-      : "Essas informações são verdadeiras dentro da história desta partida.";
-  return `<div class="investigation-panel"><div class="investigation-panel-title">${title}</div><ol>${items.map((item) => `<li>${esc(item.text_snapshot)}</li>`).join("")}</ol><small>${note}</small></div>`;
+  return `<div class="investigation-panel"><div class="investigation-panel-title">${me.role === "detetive" ? "🔎 Seus traços" : "📜 Suas informações"}</div><ol>${items.map((item) => `<li>${esc(item.text_snapshot)}</li>`).join("")}</ol><small>Informações reais da partida.</small></div>`;
 }
 
 function renderDiscussion(meta, me) {
@@ -3005,26 +2632,10 @@ function renderDayResults(meta, me) {
 }
 
 function renderTruthHtml() {
-  const truth = state.investigationCase;
-  if (!truth?.scenario) {
-    return `<div class="card truth-card"><h3>A história verdadeira</h3><p class="footnote">A história desta partida não foi carregada. Verifique se o banco de investigação foi criado corretamente.</p></div>`;
-  }
-
-  // Os fatos distribuídos aos jogadores são informações privadas escritas em
-  // primeira pessoa ("Você..."). Eles não devem aparecer no final da partida,
-  // porque esta tela é pública. A verdade oficial vem do truth_summary do caso,
-  // que descreve o que o assassino realmente fez de forma objetiva.
-  const summary =
-    truth.scenario.truth_summary || truth.scenario.description || "";
-
-  return `<div class="card truth-card">
-    <p class="eyebrow">A VERDADE DO CASO</p>
-    <h2>${esc(truth.scenario.title)}</h2>
-    <div class="truth-facts">
-      <h3>O que realmente aconteceu</h3>
-      <p class="truth-summary">${esc(summary)}</p>
-    </div>
-  </div>`;
+  const meta = state.room;
+  const scenario = getScenarioPreset(meta?.scenarioKey);
+  const revealed = Array.isArray(meta?.revealedTraits) ? meta.revealedTraits : [];
+  return `<div class="card truth-card"><p class="eyebrow">A VERDADE DA PARTIDA</p><h2>${esc(scenario.name)}</h2><div class="truth-facts"><h3>Traços reais revelados</h3>${revealed.length ? `<ul>${revealed.map((r) => `<li>${esc(TRAIT_CATEGORIES[r.axis]?.label || r.axis)}: ${esc(r.value)}</li>`).join("")}</ul>` : `<p class="truth-summary">Nenhum traço foi revelado antes do fim.</p>`}</div></div>`;
 }
 
 function renderGameOver() {
@@ -3626,6 +3237,13 @@ function trophySvg(size = 64) {
       .home-roles{margin-top:100px !important;}
     }
   `;
+  document.head.appendChild(style);
+})();
+
+/* ===== Traços: controles adicionais ===== */
+(function injectTraitStyles() {
+  const style = document.createElement("style");
+  style.textContent = `.trait-axis-picker{margin-top:10px;padding:10px;border:1px solid var(--ui-line);border-radius:10px;background:rgba(255,255,255,.025)}.trait-axis-picker .target-grid{margin-top:6px}.trait-axis-picker .target-btn{min-height:42px}`;
   document.head.appendChild(style);
 })();
 

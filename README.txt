@@ -1,9 +1,13 @@
-Cidade Dorme V5
+Cidade Dorme — Cenários e Traços
 
-A home voltou ao formato original com emojis:
-- Criar sala 🎟️
-- Entrar em sala 🚪
-- Rodapé com emojis dos papéis.
+Arquivos:
+- app.js: JavaScript atualizado.
+- reset-tracos.sql: migração para o Supabase.
 
-As telas internas continuam com a estética cinematográfica, fotos dos personagens,
-transição da noite e áudios reais.
+Cenários disponíveis no código:
+- Prefeitura
+- Cassino
+- Praia
+- Festa
+
+Cada cenário possui 3 locais, 3 objetos e 3 vestimentas.
