@@ -1065,7 +1065,6 @@ async function refreshOnce() {
   if (justDied && state.deathSequenceRound !== Number(meta.round)) {
     state.deathSequenceActive = true;
     state.deathSequenceRound = Number(meta.round);
-    playDeathSequenceSound();
 
     window.setTimeout(() => {
       // A vítima permanece exclusivamente na tela preta durante toda a
@@ -1074,6 +1073,18 @@ async function refreshOnce() {
       state.deathSequenceActive = false;
       refresh();
     }, 10000);
+  }
+
+  // O som da morte é um evento da rodada e deve ser ouvido por TODOS,
+  // inclusive pela própria vítima. A tela preta continua sendo exclusiva
+  // do jogador que morreu.
+  if (
+    meta.phase === "day_reveal" &&
+    meta.lastDeathName &&
+    state.lastDeathSoundRound !== Number(meta.round)
+  ) {
+    state.lastDeathSoundRound = Number(meta.round);
+    playDeathSequenceSound();
   }
 
   state.room = meta;
@@ -3375,20 +3386,8 @@ function renderDayReveal(meta, me) {
     <p class="eyebrow">AO AMANHECER</p>
     <h2>${message}</h2>
     <p class="tagline">${hasDeath ? "A cidade desperta lentamente para a notícia." : "A cidade desperta. Ninguém foi perdido esta noite."}</p>
-    <div class="phase-mini-timer" id="day-reveal-timer">00:07</div>
+    <div class="phase-mini-timer" id="day-reveal-timer">00:10</div>
   </div>`);
-
-  // 🔊 TODOS os jogadores escutam o som da morte
-  if (hasDeath && state.lastDeathSoundRound !== Number(meta.round)) {
-    state.lastDeathSoundRound = Number(meta.round);
-
-    try {
-      const audio = new Audio(AUDIO_ASSETS.death);
-      audio.preload = "auto";
-      audio.volume = 0.72;
-      audio.play().catch(() => {});
-    } catch (_) {}
-  }
 
   attachCountdown(card.querySelector("#day-reveal-timer"), meta);
 
