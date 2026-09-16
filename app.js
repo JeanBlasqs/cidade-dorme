@@ -297,7 +297,7 @@ const SCENARIO_PRESETS = {
     name: "Prefeitura",
     description: "Prédios públicos, arquivos e a praça central.",
     local: ["escritório", "salão de reuniões", "banheiro"],
-    objeto: ["tesoura", "chave inglesa", "pasta com documentos"],
+    objeto: ["tesoura", "chave inglesa", "maleta"],
     vestimenta: ["terno escuro", "camisa social clara", "casaco"],
   },
   cassino: {
@@ -311,14 +311,14 @@ const SCENARIO_PRESETS = {
     name: "Praia",
     description: "Calçadão, quiosques e areia à noite.",
     local: ["quiosque", "estacionamento", "vestiário"],
-    objeto: ["canivete", "tesoura", "garrafa de vidro"],
+    objeto: ["canivete", "balde", "garrafa de vidro"],
     vestimenta: ["camiseta clara", "regata escura", "jaqueta"],
   },
   festa: {
     name: "Festa",
     description: "Música, salão e áreas de serviço movimentadas.",
     local: ["salão da festa", "cozinha", "área externa"],
-    objeto: ["faca de cozinha", "saca-rolhas", "tesoura"],
+    objeto: ["faca de cozinha", "saca-rolhas", "palito de dente"],
     vestimenta: ["camisa preta", "camisa branca", "jaqueta jeans"],
   },
 };
@@ -358,22 +358,47 @@ function randomTraitValue(preset, axis) {
   return values[Math.floor(Math.random() * values.length)] || null;
 }
 
-function ensureNoSingletonValues(players, preset, axis) {
-  const values = players.map((p) => traitValue(p, axis)).filter(Boolean);
-  const counts = {};
-  values.forEach((v) => (counts[v] = (counts[v] || 0) + 1));
-  const singletons = players.filter((p) => counts[traitValue(p, axis)] === 1);
-  for (const player of singletons) {
-    const candidates = Object.entries(counts)
-      .filter(
-        ([value, count]) => count >= 2 && value !== traitValue(player, axis),
-      )
-      .sort((a, b) => b[1] - a[1]);
-    const replacement = candidates[0]?.[0] || randomTraitValue(preset, axis);
-    const old = traitValue(player, axis);
-    if (old && counts[old]) counts[old]--;
-    player[traitField(axis)] = replacement;
-    counts[replacement] = (counts[replacement] || 0) + 1;
+function assignDistributedTraitValues(players, preset, axis) {
+  const values = shuffle((preset[axis] || []).slice());
+  if (!values.length) return;
+
+  // Garante que os 3 valores do eixo apareçam antes de qualquer repetição.
+  // Com 4 jogadores, os três primeiros recebem valores diferentes e o quarto
+  // recebe aleatoriamente um dos três, em vez de repetir sempre o primeiro.
+  players.forEach((player, index) => {
+    if (index < values.length) {
+      player[traitField(axis)] = values[index];
+      return;
+    }
+
+    const randomValue = values[Math.floor(Math.random() * values.length)];
+    player[traitField(axis)] = randomValue;
+  });
+}
+
+function preserveAllTraitValues(players, preset, axis) {
+  const available = (preset[axis] || []).slice();
+  if (available.length < 3 || players.length < 3) return;
+
+  const present = new Set(
+    players.map((p) => traitValue(p, axis)).filter(Boolean),
+  );
+  const missing = available.filter((value) => !present.has(value));
+  if (!missing.length) return;
+
+  // Se alguma alteração posterior à distribuição deixou um valor sem uso,
+  // troca um jogador que esteja repetindo outro valor.
+  for (const value of missing) {
+    const candidates = players.filter((p) => {
+      const current = traitValue(p, axis);
+      return (
+        current &&
+        players.filter((x) => traitValue(x, axis) === current).length > 1
+      );
+    });
+    const player = candidates[Math.floor(Math.random() * candidates.length)];
+    if (!player) break;
+    player[traitField(axis)] = value;
   }
 }
 
@@ -387,57 +412,30 @@ function hasSameActiveCombination(a, b, axes) {
 async function dbAssignTraits(code, players, meta) {
   const preset = getScenarioPreset(meta.scenarioKey);
   const axes = getActiveAxes(meta);
-
-  console.log("=== ATRIBUINDO TRAÇOS ===");
-  console.log("Cenário:", meta.scenarioKey);
-  console.log("Categorias:", meta.traitCategories);
-  console.log("Eixos ativos:", axes);
-  console.log("Preset:", preset);
-
-  if (!axes.length) {
-    console.error("Nenhum eixo de traço ativo!");
-    return null;
-  }
-
   const enriched = players.map((p) => ({ ...p }));
 
+  for (const axis of axes) assignDistributedTraitValues(enriched, preset, axis);
+
   for (const p of enriched) {
-    for (const axis of axes) {
-      const value = randomTraitValue(preset, axis);
-
-      p[traitField(axis)] = value;
-
-      console.log(`Jogador ${p.name} | ${axis} = ${value}`);
-    }
-
     if (meta.traitCategories.includes("intencao")) {
       p.traitIntencao =
         INTENTIONS[Math.floor(Math.random() * INTENTIONS.length)];
-    } else {
-      p.traitIntencao = null;
-    }
-
+    } else p.traitIntencao = null;
     p.traitTestemunhaAxis = null;
     p.traitTestemunhaValue = null;
   }
 
-  for (const axis of axes) {
-    ensureNoSingletonValues(enriched, preset, axis);
-  }
+  for (const axis of axes) preserveAllTraitValues(enriched, preset, axis);
 
   const assassin = enriched.find((p) => p.role === "assassino");
-
   if (assassin && axes.length) {
     for (const p of enriched) {
       if (p.id === assassin.id) continue;
-
       if (hasSameActiveCombination(p, assassin, axes)) {
         const axis = axes[Math.floor(Math.random() * axes.length)];
-
         const choices = (preset[axis] || []).filter(
           (v) => v !== traitValue(assassin, axis),
         );
-
         p[traitField(axis)] =
           choices[Math.floor(Math.random() * choices.length)] ||
           randomTraitValue(preset, axis);
@@ -445,7 +443,31 @@ async function dbAssignTraits(code, players, meta) {
     }
   }
 
+  for (const axis of axes) preserveAllTraitValues(enriched, preset, axis);
+
+  if (meta.traitCategories.includes("testemunha")) {
+    const alive = enriched.filter((p) => p.alive);
+    const count = Math.max(1, Math.round(alive.length * 0.3));
+    shuffle(alive)
+      .slice(0, count)
+      .forEach((witness) => {
+        const axis = axes[Math.floor(Math.random() * axes.length)];
+        const others = alive.filter((p) => p.id !== witness.id);
+        const seen = others[Math.floor(Math.random() * others.length)];
+        if (axis && seen) {
+          witness.traitTestemunhaAxis = axis;
+          witness.traitTestemunhaValue = traitValue(seen, axis);
+        }
+      });
+  }
+
   const updates = enriched.map((p) => ({
+    room_code: code,
+    id: p.id,
+    name: p.name,
+    alive: p.alive,
+    role: p.role,
+    ready_round: 0,
     trait_local: p.traitLocal || null,
     trait_objeto: p.traitObjeto || null,
     trait_vestimenta: p.traitVestimenta || null,
@@ -453,27 +475,13 @@ async function dbAssignTraits(code, players, meta) {
     trait_testemunha_axis: p.traitTestemunhaAxis || null,
     trait_testemunha_value: p.traitTestemunhaValue || null,
   }));
-
-  console.log("Valores que serão gravados:", updates);
-
-  for (let i = 0; i < enriched.length; i++) {
-    const player = enriched[i];
-    const values = updates[i];
-
-    const { error } = await sb
-      .from("players")
-      .update(values)
-      .eq("room_code", code)
-      .eq("id", player.id);
-
-    if (error) {
-      console.error("ERRO AO GRAVAR TRAÇOS:", player.name, error);
-      return null;
-    }
+  const { error } = await sb
+    .from("players")
+    .upsert(updates, { onConflict: "room_code,id" });
+  if (error) {
+    console.error("dbAssignTraits", error);
+    return null;
   }
-
-  console.log("=== TRAÇOS GRAVADOS COM SUCESSO ===");
-
   return enriched;
 }
 
@@ -541,7 +549,7 @@ async function dbRevealNextTraits(code, meta, players) {
       log,
     })
     .eq("code", code)
-    .eq("phase", "day_reveal");
+    .eq("phase", "role_reveal");
   if (error) {
     console.error("dbRevealNextTraits", error);
     return meta;
@@ -1048,7 +1056,14 @@ async function refreshOnce() {
     updateReadyCountDisplay(players, meta.round);
   }
 
-  if (meta.phase === "day_reveal" && state.isHost) {
+  // A partir da segunda rodada, a pista do assassino é preparada antes da
+  // tela de informações/"Li tudo — estou pronto". Na primeira rodada não há
+  // pista do assassino.
+  if (
+    meta.phase === "role_reveal" &&
+    Number(meta.round || 1) > 1 &&
+    state.isHost
+  ) {
     const revealedMeta = await dbRevealNextTraits(
       state.roomCode,
       meta,
@@ -2526,6 +2541,26 @@ function updateReadyCountDisplay(players, round) {
     : "Aguardando jogadores...";
 }
 
+function renderRoundTraitRevealHtml(meta) {
+  const revealed = Array.isArray(meta.revealedTraits)
+    ? meta.revealedTraits
+    : [];
+  if (!revealed.length) {
+    return `<div class="investigation-private-info round-trait-reveal"><div class="investigation-private-title">Nenhuma nova informação nesta rodada.</div></div>`;
+  }
+
+  return `<div class="investigation-private-info round-trait-reveal">
+    <div class="investigation-private-title">🔎 Nova informação sobre o assassino</div>
+    <ol>${revealed
+      .map((item) => {
+        const label = TRAIT_CATEGORIES[item.axis]?.label || item.axis;
+        return `<li><strong>${esc(label)}:</strong> ${esc(item.value)}</li>`;
+      })
+      .join("")}</ol>
+    <small>Essas informações são verdadeiras e ficam disponíveis para todos.</small>
+  </div>`;
+}
+
 function renderRoleReveal(meta, me) {
   const firstRound = Number(meta.round || 1) === 1;
   const info = ROLE_INFO[me.role] || ROLE_INFO.cidadao;
@@ -2546,7 +2581,7 @@ function renderRoleReveal(meta, me) {
         <p class="tagline role-description">Seu papel já foi revelado. Confira novamente apenas suas informações da investigação.</p>
       `
       }
-      ${renderInvestigationItemsHtml(me, meta)}
+      ${firstRound ? renderInvestigationItemsHtml(me, meta) : renderRoundTraitRevealHtml(meta)}
       <div class="ready-status" id="ready-status">
         ${Number(me.readyRound || 0) === Number(meta.round) ? "Você já confirmou que está pronto." : "Leia suas informações antes de confirmar."}
       </div>
@@ -2633,12 +2668,13 @@ function renderNightPanel(meta, me) {
     card.innerHTML = `${roleAvatar("cidadao")}<div><p class="eyebrow">NOITE — SUA VEZ DE OBSERVAR</p><h2>Você é o Cidadão</h2><p>Você não tem ação nesta noite. Observe em silêncio.</p></div>`;
     return card;
   }
+
   const headings = {
     assassino: ["Escolha uma vítima", "Escolha uma pessoa para eliminar."],
     anjo: ["Escolha quem proteger", "Escolha uma pessoa para proteger."],
     detetive: [
-      "Escolha uma pessoa e um eixo",
-      "Descubra o valor real de um traço dessa pessoa.",
+      "Escolha uma pessoa",
+      "Clique em um nome para escolher qual traço investigar.",
     ],
   };
   const [title, subtitle] = headings[me.role] || headings.cidadao;
@@ -2648,86 +2684,113 @@ function renderNightPanel(meta, me) {
       : me.role === "detetive"
         ? aliveOthers(me.id)
         : (state.players || []).filter((p) => p.alive);
-  const box = el(
-    `<div><div class="night-role-header">${roleAvatar(me.role)}<div><p class="eyebrow">NOITE — SUA AÇÃO</p><h2>Você é o <strong>${esc(ROLE_INFO[me.role].name)}</strong></h2></div></div><div class="action-heading">${roleActionIcon(me.role, 52)}<div><h3>${title}</h3><p>${subtitle}</p></div></div><div class="target-grid visual-target-grid" id="night-targets"></div></div>`,
-  );
+
+  const box = el(`<div>
+    <div class="night-role-header">
+      ${roleAvatar(me.role)}
+      <div><p class="eyebrow">NOITE — SUA AÇÃO</p><h2>Você é o <strong>${esc(ROLE_INFO[me.role].name)}</strong></h2></div>
+    </div>
+    <div class="action-heading">${roleActionIcon(me.role, 52)}<div><h3>${title}</h3><p>${subtitle}</p></div></div>
+    <div class="target-grid visual-target-grid" id="night-targets"></div>
+  </div>`);
+
   const grid = box.querySelector("#night-targets");
+
   targets.forEach((t) => {
-    const row = el(`<div class="action-target-row visual-target-row"></div>`);
+    const selected = state.selectedTarget === t.id;
+    const row = el(
+      `<div class="action-target-row visual-target-row${selected && me.role === "detetive" ? " investigation-open-row" : ""}"></div>`,
+    );
     const button = el(
       `<button class="target-btn action-target-button visual-target-button"></button>`,
     );
     button.innerHTML = `${playerAvatar(t.name)}<span>${esc(t.name)}</span>`;
-    if (state.selectedTarget === t.id) button.classList.add("selected");
+    if (selected) button.classList.add("selected");
     button.disabled = state.nightActionConfirmed;
+
     button.onclick = () => {
+      if (state.nightActionConfirmed) return;
       state.selectedTarget = t.id;
       if (me.role !== "detetive") state.selectedAxis = null;
+      else state.selectedAxis = selected ? state.selectedAxis : null;
       render();
     };
     row.appendChild(button);
-    if (state.selectedTarget === t.id && !state.nightActionConfirmed) {
-      if (me.role === "detetive") {
-        const axisBox = el(
-          `<div class="trait-axis-picker"><p class="footnote">O que investigar?</p><div class="target-grid" id="axis-options"></div></div>`,
+
+    if (selected && !state.nightActionConfirmed && me.role === "detetive") {
+      const popover = el(`<div class="trait-investigation-popover">
+        <div class="trait-popover-title">O que investigar?</div>
+        <div class="trait-popover-options" id="axis-options"></div>
+      </div>`);
+      const options = popover.querySelector("#axis-options");
+
+      getActiveAxes(meta).forEach((axis) => {
+        const optionRow = el(`<div class="trait-popover-option-row"></div>`);
+        const option = el(
+          `<button class="trait-popover-option ${state.selectedAxis === axis ? "selected" : ""}"><span>${esc(TRAIT_CATEGORIES[axis].label)}</span></button>`,
         );
-        const axisGrid = axisBox.querySelector("#axis-options");
-        getActiveAxes(meta).forEach((axis) => {
-          const b = el(
-            `<button class="target-btn ${state.selectedAxis === axis ? "selected" : ""}"><span>${esc(TRAIT_CATEGORIES[axis].label)}</span></button>`,
+        option.onclick = () => {
+          state.selectedAxis = axis;
+          render();
+        };
+        optionRow.appendChild(option);
+
+        if (state.selectedAxis === axis) {
+          const confirm = el(
+            `<button class="trait-popover-confirm" title="Confirmar investigação" aria-label="Confirmar investigação">Confirmar</button>`,
           );
-          b.onclick = () => {
-            state.selectedAxis = axis;
-            render();
+          confirm.onclick = (event) => {
+            event.stopPropagation();
+            confirmNightAction();
           };
-          axisGrid.appendChild(b);
-        });
-        row.appendChild(axisBox);
-      }
-      if (me.role !== "detetive" || state.selectedAxis) {
-        const confirm = el(
-          `<button class="action-confirm-btn" title="Confirmar ação" aria-label="Confirmar ação">✓</button>`,
-        );
-        confirm.onclick = confirmNightAction;
-        row.appendChild(confirm);
-      }
+          optionRow.appendChild(confirm);
+        }
+        options.appendChild(optionRow);
+      });
+      row.appendChild(popover);
     }
+
+    if (selected && !state.nightActionConfirmed && me.role !== "detetive") {
+      const confirm = el(
+        `<button class="action-confirm-btn" title="Confirmar ação" aria-label="Confirmar ação">✓</button>`,
+      );
+      confirm.onclick = confirmNightAction;
+      row.appendChild(confirm);
+    }
+
     grid.appendChild(row);
   });
+
   if (state.nightActionConfirmed) {
     if (me.role === "detetive") {
       const chosen = targets.find((t) => t.id === state.selectedTarget);
       const value = chosen ? traitValue(chosen, state.selectedAxis) : null;
       const label =
         TRAIT_CATEGORIES[state.selectedAxis]?.description || "Traço";
-      if (chosen && value)
+      if (chosen && value) {
         box.appendChild(
           el(
-            `<div class="investigation-result positive"><span class="investigation-symbol">✓</span><div><strong>${esc(chosen.name)} — ${esc(label)}</strong><p>${esc(value)}</p></div></div>`,
+            `<div class="investigation-result"><div><strong>${esc(chosen.name)} — ${esc(label)}</strong><p>${esc(value)}</p></div></div>`,
           ),
         );
-    } else
+      }
+    } else {
       box.appendChild(
         el(
           `<div class="action-confirmed"><span class="confirm-check">✓</span><span>Ação confirmada.</span></div>`,
         ),
       );
+    }
   }
+
   card.appendChild(box);
   return card;
 }
 
 function renderDayReveal(meta, me) {
-  const revealed = Array.isArray(meta.revealedTraits)
-    ? meta.revealedTraits
-    : [];
-  const last = revealed[revealed.length - 1];
-  const label = last ? TRAIT_CATEGORIES[last.axis]?.label || last.axis : null;
-  const message = last
-    ? `Descobriu-se que o assassino estava com ${label.toLowerCase()}: ${last.value}.`
-    : meta.lastDeathName
-      ? `${esc(meta.lastDeathName)} não sobreviveu à noite.`
-      : "Ninguém morreu esta noite.";
+  const message = meta.lastDeathName
+    ? `${esc(meta.lastDeathName)} não sobreviveu à noite.`
+    : "Ninguém morreu esta noite.";
   const card = el(
     `<div class="card day-event-card"><div class="event-icon death-icon">${meta.lastDeathName ? skullSvg(58) : sunriseSvg(58)}</div><p class="eyebrow">AO AMANHECER</p><h2>${message}</h2><p class="tagline">A cidade terá alguns segundos para absorver o que aconteceu.</p><div class="phase-mini-timer" id="day-reveal-timer">00:07</div></div>`,
   );
@@ -2747,7 +2810,6 @@ function renderDiscussion(meta, me) {
       ${sunSvg(42)}
       <div><p class="eyebrow">FASE DE DISCUSSÃO</p><h2>Conversem e descubram os assassinos.</h2></div>
     </div>
-    ${renderInvestigationPanelHtml(me)}
     <div class="timer-panel"><span>Tempo restante</span><strong id="timer-display">--:--</strong></div>
     <p class="footnote">A discussão termina automaticamente. Depois começa a votação.</p>
   </div>`);
@@ -3142,10 +3204,7 @@ function trophySvg(size = 64) {
       border:1px solid var(--line, #24375c);
       background:rgba(255,255,255,.03);
     }
-    .investigation-symbol {
-      font-size:4.5rem;
-      line-height:1;
-    }
+    
     .lobby-settings .field { margin-top:14px; }
     .lobby-settings select {
       width:100%;
@@ -3320,8 +3379,31 @@ function trophySvg(size = 64) {
     .role-avatar-large{width:90px;height:90px;min-width:90px;}
     .player-avatar{width:34px;height:34px;min-width:34px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(145deg,#172c51,#0a1731);border:1px solid rgba(137,170,225,.38);color:#e7efff;font-size:.72rem;font-weight:700;letter-spacing:.04em;}
     .visual-target-grid{display:grid;gap:8px;}
-    .visual-target-row{display:flex;gap:8px;}
+    .visual-target-row{display:flex;gap:8px;position:relative;z-index:1;}
+    .visual-target-row:has(.trait-investigation-popover){z-index:30;}
     .visual-target-button{display:flex !important;align-items:center;gap:12px;text-align:left !important;padding:10px 12px !important;min-height:56px;}
+    .trait-investigation-popover{
+      position:absolute;
+      left:0;
+      right:0;
+      top:calc(100% + 6px);
+      z-index:50;
+      padding:10px;
+      border:1px solid rgba(244,190,77,.5);
+      border-radius:12px;
+      background:rgba(4,16,38,.98);
+      box-shadow:0 18px 45px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.025);
+    }
+    .trait-popover-title{font-size:.75rem;text-transform:uppercase;letter-spacing:.12em;color:var(--ui-muted);margin:0 2px 8px;}
+    .trait-popover-options{display:grid;gap:6px;}
+    .trait-popover-option-row{display:flex;gap:6px;min-width:0;}
+    .trait-popover-option{flex:1;min-width:0;display:flex;align-items:center;justify-content:space-between;padding:9px 11px;border:1px solid rgba(111,146,208,.3);border-radius:9px;background:rgba(5,20,47,.92);color:var(--ui-text);text-align:left;cursor:pointer;}
+    .trait-popover-option:hover{border-color:rgba(244,190,77,.7);}
+    .trait-popover-option.selected{border-color:#f4be4d;box-shadow:0 0 0 1px rgba(244,190,77,.2);}
+    .trait-popover-confirm{flex:none;padding:9px 12px;border:0;border-radius:9px;background:linear-gradient(180deg,#f7c85a,#e9a92f);color:#111827;font-weight:700;cursor:pointer;white-space:nowrap;}
+    .trait-popover-confirm:hover{filter:brightness(1.06);}
+    .round-trait-reveal{margin-top:14px;}
+    .round-trait-reveal ol{margin-bottom:8px;}
     .visual-target-button span:last-child{flex:1;}
     .visual-target-button small{color:var(--ui-muted);}
     .action-confirm-btn{width:54px;min-width:54px;display:grid;place-items:center;}
@@ -3334,9 +3416,7 @@ function trophySvg(size = 64) {
     .waiting-role-panel h3{margin:8px 0;font-family:Georgia,serif;}
     .waiting-role-panel p{max-width:520px;margin:0 auto;color:var(--ui-muted);}
     .investigation-result{display:flex !important;align-items:center;justify-content:center;gap:16px;min-height:92px;margin-top:16px;border-radius:14px !important;}
-    .investigation-result.positive{border-color:rgba(92,218,157,.5) !important;}
-    .investigation-result.negative{border-color:rgba(232,91,101,.45) !important;}
-    .investigation-symbol{font-size:3.3rem;line-height:1;font-weight:700;}
+    
     .investigation-result p{margin:3px 0 0;color:var(--ui-muted);}
     .timer-panel{display:flex;align-items:center;justify-content:space-between;padding:15px 18px;border:1px solid var(--ui-line);border-radius:13px;background:rgba(2,10,25,.55);margin:14px 0 16px;}
     .timer-panel span{color:var(--ui-muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.12em;}
