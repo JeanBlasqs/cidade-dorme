@@ -31,13 +31,19 @@ function metaFromRow(row) {
     winner: row.winner,
     discussionSeconds: row.discussion_seconds || 60,
     votingSeconds: row.voting_seconds || 45,
-    phaseEndsAt: row.phase_ends_at ? new Date(row.phase_ends_at).getTime() : null,
+    phaseEndsAt: row.phase_ends_at
+      ? new Date(row.phase_ends_at).getTime()
+      : null,
     investigationGameId: row.investigation_game_id || null,
     scenarioKey: row.scenario_key || "prefeitura",
-    traitCategories: Array.isArray(row.trait_categories) ? row.trait_categories : ["local", "objeto", "vestimenta"],
+    traitCategories: Array.isArray(row.trait_categories)
+      ? row.trait_categories
+      : ["local", "objeto", "vestimenta"],
     cluesPerRound: Number(row.clues_per_round) || 1,
     revealOrder: Array.isArray(row.reveal_order) ? row.reveal_order : [],
-    revealedTraits: Array.isArray(row.revealed_traits) ? row.revealed_traits : [],
+    revealedTraits: Array.isArray(row.revealed_traits)
+      ? row.revealed_traits
+      : [],
   };
 }
 function rowFromMeta(code, meta) {
@@ -53,13 +59,19 @@ function rowFromMeta(code, meta) {
     winner: meta.winner,
     discussion_seconds: meta.discussionSeconds,
     voting_seconds: meta.votingSeconds,
-    phase_ends_at: meta.phaseEndsAt ? new Date(meta.phaseEndsAt).toISOString() : null,
+    phase_ends_at: meta.phaseEndsAt
+      ? new Date(meta.phaseEndsAt).toISOString()
+      : null,
     investigation_game_id: meta.investigationGameId || null,
     scenario_key: meta.scenarioKey || "prefeitura",
-    trait_categories: Array.isArray(meta.traitCategories) ? meta.traitCategories : ["local", "objeto", "vestimenta"],
+    trait_categories: Array.isArray(meta.traitCategories)
+      ? meta.traitCategories
+      : ["local", "objeto", "vestimenta"],
     clues_per_round: Number(meta.cluesPerRound) || 1,
     reveal_order: Array.isArray(meta.revealOrder) ? meta.revealOrder : [],
-    revealed_traits: Array.isArray(meta.revealedTraits) ? meta.revealedTraits : [],
+    revealed_traits: Array.isArray(meta.revealedTraits)
+      ? meta.revealedTraits
+      : [],
   };
 }
 async function dbGetRoom(code) {
@@ -177,11 +189,27 @@ async function tryAdvanceRoleReveal() {
   return true;
 }
 
-async function dbSubmitNightAction(code, round, role, playerId, targetId, targetAxis = null) {
-  const { error } = await sb.from("night_actions").upsert(
-    { room_code: code, round, role, player_id: playerId, target_id: targetId, target_axis: targetAxis },
-    { onConflict: "room_code,round,role,player_id" },
-  );
+async function dbSubmitNightAction(
+  code,
+  round,
+  role,
+  playerId,
+  targetId,
+  targetAxis = null,
+) {
+  const { error } = await sb
+    .from("night_actions")
+    .upsert(
+      {
+        room_code: code,
+        round,
+        role,
+        player_id: playerId,
+        target_id: targetId,
+        target_axis: targetAxis,
+      },
+      { onConflict: "room_code,round,role,player_id" },
+    );
   if (error) console.error("dbSubmitNightAction", error);
 }
 async function dbGetNightActions(code, round, role) {
@@ -195,7 +223,11 @@ async function dbGetNightActions(code, round, role) {
     console.error("dbGetNightActions", error);
     return [];
   }
-  return data.map((r) => ({ playerId: r.player_id, targetId: r.target_id, targetAxis: r.target_axis || null }));
+  return data.map((r) => ({
+    playerId: r.player_id,
+    targetId: r.target_id,
+    targetAxis: r.target_axis || null,
+  }));
 }
 async function dbSubmitVote(code, round, voterId, targetId) {
   const { error } = await sb.from("votes").upsert(
@@ -244,7 +276,11 @@ const TRAIT_CATEGORIES = {
   local: { label: "Local", description: "Onde estava" },
   objeto: { label: "Objeto", description: "O que levava" },
   vestimenta: { label: "Vestimenta", description: "O que vestia" },
-  intencao: { label: "Intenção", description: "O que pretendia fazer", flavor: true },
+  intencao: {
+    label: "Intenção",
+    description: "O que pretendia fazer",
+    flavor: true,
+  },
   testemunha: { label: "Testemunha", description: "Viu alguém", flavor: true },
 };
 
@@ -290,7 +326,9 @@ const SCENARIO_PRESETS = {
 };
 
 function normalizeTraitCategories(value) {
-  const input = Array.isArray(value) ? value : ["local", "objeto", "vestimenta"];
+  const input = Array.isArray(value)
+    ? value
+    : ["local", "objeto", "vestimenta"];
   const allowed = Object.keys(TRAIT_CATEGORIES);
   const result = [...new Set(input.filter((x) => allowed.includes(x)))];
   const axes = result.filter((x) => DEDUCIBLE_AXES.includes(x));
@@ -303,7 +341,9 @@ function getScenarioPreset(key) {
 }
 
 function getActiveAxes(meta) {
-  return normalizeTraitCategories(meta?.traitCategories).filter((x) => DEDUCIBLE_AXES.includes(x));
+  return normalizeTraitCategories(meta?.traitCategories).filter((x) =>
+    DEDUCIBLE_AXES.includes(x),
+  );
 }
 
 function traitValue(player, axis) {
@@ -312,7 +352,7 @@ function traitValue(player, axis) {
 }
 
 function traitField(axis) {
-  return `trait_${axis}`;
+  return `trait${axis.charAt(0).toUpperCase()}${axis.slice(1)}`;
 }
 
 function randomTraitValue(preset, axis) {
@@ -327,7 +367,9 @@ function ensureNoSingletonValues(players, preset, axis) {
   const singletons = players.filter((p) => counts[traitValue(p, axis)] === 1);
   for (const player of singletons) {
     const candidates = Object.entries(counts)
-      .filter(([value, count]) => count >= 2 && value !== traitValue(player, axis))
+      .filter(
+        ([value, count]) => count >= 2 && value !== traitValue(player, axis),
+      )
       .sort((a, b) => b[1] - a[1]);
     const replacement = candidates[0]?.[0] || randomTraitValue(preset, axis);
     const old = traitValue(player, axis);
@@ -338,7 +380,10 @@ function ensureNoSingletonValues(players, preset, axis) {
 }
 
 function hasSameActiveCombination(a, b, axes) {
-  return axes.length > 0 && axes.every((axis) => traitValue(a, axis) === traitValue(b, axis));
+  return (
+    axes.length > 0 &&
+    axes.every((axis) => traitValue(a, axis) === traitValue(b, axis))
+  );
 }
 
 async function dbAssignTraits(code, players, meta) {
@@ -347,9 +392,11 @@ async function dbAssignTraits(code, players, meta) {
   const enriched = players.map((p) => ({ ...p }));
 
   for (const p of enriched) {
-    for (const axis of axes) p[traitField(axis)] = randomTraitValue(preset, axis);
+    for (const axis of axes)
+      p[traitField(axis)] = randomTraitValue(preset, axis);
     if (meta.traitCategories.includes("intencao")) {
-      p.traitIntencao = INTENTIONS[Math.floor(Math.random() * INTENTIONS.length)];
+      p.traitIntencao =
+        INTENTIONS[Math.floor(Math.random() * INTENTIONS.length)];
     } else p.traitIntencao = null;
     p.traitTestemunhaAxis = null;
     p.traitTestemunhaValue = null;
@@ -363,8 +410,12 @@ async function dbAssignTraits(code, players, meta) {
       if (p.id === assassin.id) continue;
       if (hasSameActiveCombination(p, assassin, axes)) {
         const axis = axes[Math.floor(Math.random() * axes.length)];
-        const choices = (preset[axis] || []).filter((v) => v !== traitValue(assassin, axis));
-        p[traitField(axis)] = choices[Math.floor(Math.random() * choices.length)] || randomTraitValue(preset, axis);
+        const choices = (preset[axis] || []).filter(
+          (v) => v !== traitValue(assassin, axis),
+        );
+        p[traitField(axis)] =
+          choices[Math.floor(Math.random() * choices.length)] ||
+          randomTraitValue(preset, axis);
       }
     }
   }
@@ -372,15 +423,17 @@ async function dbAssignTraits(code, players, meta) {
   if (meta.traitCategories.includes("testemunha")) {
     const alive = enriched.filter((p) => p.alive);
     const count = Math.max(1, Math.round(alive.length * 0.3));
-    shuffle(alive).slice(0, count).forEach((witness) => {
-      const axis = axes[Math.floor(Math.random() * axes.length)];
-      const others = alive.filter((p) => p.id !== witness.id);
-      const seen = others[Math.floor(Math.random() * others.length)];
-      if (axis && seen) {
-        witness.traitTestemunhaAxis = axis;
-        witness.traitTestemunhaValue = traitValue(seen, axis);
-      }
-    });
+    shuffle(alive)
+      .slice(0, count)
+      .forEach((witness) => {
+        const axis = axes[Math.floor(Math.random() * axes.length)];
+        const others = alive.filter((p) => p.id !== witness.id);
+        const seen = others[Math.floor(Math.random() * others.length)];
+        if (axis && seen) {
+          witness.traitTestemunhaAxis = axis;
+          witness.traitTestemunhaValue = traitValue(seen, axis);
+        }
+      });
   }
 
   const updates = enriched.map((p) => ({
@@ -397,7 +450,9 @@ async function dbAssignTraits(code, players, meta) {
     trait_testemunha_axis: p.traitTestemunhaAxis || null,
     trait_testemunha_value: p.traitTestemunhaValue || null,
   }));
-  const { error } = await sb.from("players").upsert(updates, { onConflict: "room_code,id" });
+  const { error } = await sb
+    .from("players")
+    .upsert(updates, { onConflict: "room_code,id" });
   if (error) {
     console.error("dbAssignTraits", error);
     return null;
@@ -407,10 +462,17 @@ async function dbAssignTraits(code, players, meta) {
 
 async function dbRevealNextTraits(code, meta, players) {
   const axes = getActiveAxes(meta);
-  const revealed = Array.isArray(meta.revealedTraits) ? meta.revealedTraits.slice() : [];
-  const order = Array.isArray(meta.revealOrder) && meta.revealOrder.length ? meta.revealOrder.slice() : shuffle(axes);
+  const revealed = Array.isArray(meta.revealedTraits)
+    ? meta.revealedTraits.slice()
+    : [];
+  const order =
+    Array.isArray(meta.revealOrder) && meta.revealOrder.length
+      ? meta.revealOrder.slice()
+      : shuffle(axes);
   const revealedAxes = new Set(revealed.map((x) => x.axis));
-  const assassin = (players || []).find((p) => p.alive && p.role === "assassino");
+  const assassin = (players || []).find(
+    (p) => p.alive && p.role === "assassino",
+  );
   if (!assassin) return meta;
 
   let added = 0;
@@ -421,7 +483,9 @@ async function dbRevealNextTraits(code, meta, players) {
     const axis = queue.shift();
     if (revealedAxes.has(axis)) continue;
     const value = traitValue(assassin, axis);
-    const aliveCount = (players || []).filter((p) => p.alive && traitValue(p, axis) === value).length;
+    const aliveCount = (players || []).filter(
+      (p) => p.alive && traitValue(p, axis) === value,
+    ).length;
     if (aliveCount < 3) {
       fallback.push(axis);
       continue;
@@ -446,10 +510,19 @@ async function dbRevealNextTraits(code, meta, players) {
     const line = `Descobriu-se que o assassino estava com ${label.toLowerCase()}: ${value}.`;
     if (!log.includes(line)) log.push(line);
   });
-  const nextMeta = { ...meta, revealOrder: queue.concat(fallback), revealedTraits: revealed, log };
+  const nextMeta = {
+    ...meta,
+    revealOrder: queue.concat(fallback),
+    revealedTraits: revealed,
+    log,
+  };
   const { error } = await sb
     .from("rooms")
-    .update({ reveal_order: nextMeta.revealOrder, revealed_traits: revealed, log })
+    .update({
+      reveal_order: nextMeta.revealOrder,
+      revealed_traits: revealed,
+      log,
+    })
     .eq("code", code)
     .eq("phase", "day_reveal");
   if (error) {
@@ -468,14 +541,33 @@ async function dbGetMyInvestigationItems(gameId, playerId, playerRole) {
   const items = [];
   axes.forEach((axis) => {
     const value = traitValue(player, axis);
-    if (value) items.push({ item_type: "trait", axis, text_snapshot: `${TRAIT_CATEGORIES[axis].description}: ${value}` });
+    if (value)
+      items.push({
+        item_type: "trait",
+        axis,
+        text_snapshot: `${TRAIT_CATEGORIES[axis].description}: ${value}`,
+      });
   });
   if (meta?.traitCategories?.includes("intencao") && player.traitIntencao) {
-    items.push({ item_type: "trait", axis: "intencao", text_snapshot: `Intenção: ${player.traitIntencao}` });
+    items.push({
+      item_type: "trait",
+      axis: "intencao",
+      text_snapshot: `Intenção: ${player.traitIntencao}`,
+    });
   }
-  if (meta?.traitCategories?.includes("testemunha") && player.traitTestemunhaAxis && player.traitTestemunhaValue) {
-    const label = TRAIT_CATEGORIES[player.traitTestemunhaAxis]?.description || player.traitTestemunhaAxis;
-    items.push({ item_type: "trait", axis: "testemunha", text_snapshot: `Você viu alguém ${player.traitTestemunhaValue} (${label.toLowerCase()}).` });
+  if (
+    meta?.traitCategories?.includes("testemunha") &&
+    player.traitTestemunhaAxis &&
+    player.traitTestemunhaValue
+  ) {
+    const label =
+      TRAIT_CATEGORIES[player.traitTestemunhaAxis]?.description ||
+      player.traitTestemunhaAxis;
+    items.push({
+      item_type: "trait",
+      axis: "testemunha",
+      text_snapshot: `Você viu alguém ${player.traitTestemunhaValue} (${label.toLowerCase()}).`,
+    });
   }
   return items;
 }
@@ -717,15 +809,25 @@ async function createRoom(name) {
   enterLobby();
 }
 
-async function updateRoomSettings(discussionSeconds, votingSeconds, scenarioKey, traitCategories, cluesPerRound) {
-  if (!state.isHost || !state.roomCode || state.room?.status !== "lobby") return;
+async function updateRoomSettings(
+  discussionSeconds,
+  votingSeconds,
+  scenarioKey,
+  traitCategories,
+  cluesPerRound,
+) {
+  if (!state.isHost || !state.roomCode || state.room?.status !== "lobby")
+    return;
   const meta = await dbGetRoom(state.roomCode);
   if (!meta || meta.status !== "lobby") return;
   meta.discussionSeconds = Number(discussionSeconds) || 90;
   meta.votingSeconds = Number(votingSeconds) || 30;
   meta.scenarioKey = SCENARIO_PRESETS[scenarioKey] ? scenarioKey : "prefeitura";
   meta.traitCategories = normalizeTraitCategories(traitCategories);
-  meta.cluesPerRound = Math.max(1, Math.min(Number(cluesPerRound) || 1, getActiveAxes(meta).length));
+  meta.cluesPerRound = Math.max(
+    1,
+    Math.min(Number(cluesPerRound) || 1, getActiveAxes(meta).length),
+  );
   await dbUpdateRoom(state.roomCode, meta);
   state.room = meta;
 }
@@ -808,7 +910,13 @@ async function refreshOnce() {
 
   if (meta.status === "active") {
     const me = players.find((p) => p.id === state.playerId);
-    state.investigationItems = me ? await dbGetMyInvestigationItems(meta.investigationGameId, me.id, me.role) : [];
+    state.investigationItems = me
+      ? await dbGetMyInvestigationItems(
+          meta.investigationGameId,
+          me.id,
+          me.role,
+        )
+      : [];
     state.investigationCase = null;
   } else {
     state.investigationItems = [];
@@ -924,7 +1032,11 @@ async function refreshOnce() {
   }
 
   if (meta.phase === "day_reveal" && state.isHost) {
-    const revealedMeta = await dbRevealNextTraits(state.roomCode, meta, players);
+    const revealedMeta = await dbRevealNextTraits(
+      state.roomCode,
+      meta,
+      players,
+    );
     if (revealedMeta !== meta) {
       state.room = revealedMeta;
       return refresh();
@@ -1342,7 +1454,11 @@ async function hostStartGame() {
 
   meta.revealOrder = shuffle(getActiveAxes(meta));
   meta.revealedTraits = [];
-  const traitPlayers = await dbAssignTraits(state.roomCode, assignedPlayers, meta);
+  const traitPlayers = await dbAssignTraits(
+    state.roomCode,
+    assignedPlayers,
+    meta,
+  );
   if (!traitPlayers) {
     state.busy = false;
     state.error = "Não foi possível sortear os traços desta partida.";
@@ -1376,8 +1492,11 @@ async function confirmNightAction() {
   const validRoles = ["assassino", "anjo", "detetive"];
   if (!validRoles.includes(me.role)) return;
   if (me.role === "detetive" && !state.selectedAxis) return;
-  const target = (state.players || []).find((p) => p.id === state.selectedTarget);
-  if (!target || !target.alive || (target.id === me.id && me.role !== "anjo")) return;
+  const target = (state.players || []).find(
+    (p) => p.id === state.selectedTarget,
+  );
+  if (!target || !target.alive || (target.id === me.id && me.role !== "anjo"))
+    return;
   await dbSubmitNightAction(
     state.roomCode,
     state.room.round,
@@ -2085,7 +2204,12 @@ function renderLobby() {
       <div class="field">
         <label for="scenario-select">Cenário</label>
         <select id="scenario-select" ${state.isHost ? "" : "disabled"}>
-          ${Object.entries(SCENARIO_PRESETS).map(([key, s]) => `<option value="${key}" ${state.room?.scenarioKey === key ? "selected" : ""}>${esc(s.name)}</option>`).join("")}
+          ${Object.entries(SCENARIO_PRESETS)
+            .map(
+              ([key, s]) =>
+                `<option value="${key}" ${state.room?.scenarioKey === key ? "selected" : ""}>${esc(s.name)}</option>`,
+            )
+            .join("")}
         </select>
         <p class="footnote">${esc(getScenarioPreset(state.room?.scenarioKey).description)}</p>
       </div>
@@ -2093,7 +2217,12 @@ function renderLobby() {
       <div class="field">
         <label>Informações ativas</label>
         <div style="display:grid;gap:8px;margin-top:8px;">
-          ${Object.entries(TRAIT_CATEGORIES).map(([key, info]) => `<label style="display:flex;gap:8px;align-items:center;"><input type="checkbox" class="trait-category" value="${key}" ${normalizeTraitCategories(state.room?.traitCategories).includes(key) ? "checked" : ""} ${state.isHost ? "" : "disabled"}> <span>${esc(info.label)}</span></label>`).join("")}
+          ${Object.entries(TRAIT_CATEGORIES)
+            .map(
+              ([key, info]) =>
+                `<label style="display:flex;gap:8px;align-items:center;"><input type="checkbox" class="trait-category" value="${key}" ${normalizeTraitCategories(state.room?.traitCategories).includes(key) ? "checked" : ""} ${state.isHost ? "" : "disabled"}> <span>${esc(info.label)}</span></label>`,
+            )
+            .join("")}
         </div>
         <p class="footnote">Local, objeto e vestimenta são os eixos dedutíveis. Testemunha torna a informação mais forte; intenção é apenas narrativa.</p>
       </div>
@@ -2144,19 +2273,40 @@ function renderLobby() {
   if (state.isHost) {
     const saveSettings = async () => {
       if (state.busy) return;
-      const selected = categoryChecks.filter((c) => c.checked).map((c) => c.value);
-      const axesCount = selected.filter((x) => DEDUCIBLE_AXES.includes(x)).length;
+      const selected = categoryChecks
+        .filter((c) => c.checked)
+        .map((c) => c.value);
+      const axesCount = selected.filter((x) =>
+        DEDUCIBLE_AXES.includes(x),
+      ).length;
       if (!axesCount) {
         const local = categoryChecks.find((c) => c.value === "local");
         if (local) local.checked = true;
         selected.push("local");
       }
-      const max = Math.max(1, selected.filter((x) => DEDUCIBLE_AXES.includes(x)).length);
+      const max = Math.max(
+        1,
+        selected.filter((x) => DEDUCIBLE_AXES.includes(x)).length,
+      );
       clueInput.max = String(max);
       if (Number(clueInput.value) > max) clueInput.value = String(max);
-      await updateRoomSettings(discussionSelect.value, votingSelect.value, scenarioSelect.value, selected, clueInput.value);
+      await updateRoomSettings(
+        discussionSelect.value,
+        votingSelect.value,
+        scenarioSelect.value,
+        selected,
+        clueInput.value,
+      );
     };
-    [discussionSelect, votingSelect, scenarioSelect, clueInput, ...categoryChecks].forEach((input) => { if (input) input.onchange = saveSettings; });
+    [
+      discussionSelect,
+      votingSelect,
+      scenarioSelect,
+      clueInput,
+      ...categoryChecks,
+    ].forEach((input) => {
+      if (input) input.onchange = saveSettings;
+    });
   }
 
   return wrap;
@@ -2339,7 +2489,8 @@ function renderNightTransition(meta) {
 function renderInvestigationItemsHtml(me, meta) {
   const items = state.investigationItems || [];
   if (!items.length) return "";
-  const title = me.role === "detetive" ? "🔎 Seus traços" : "📜 Suas informações";
+  const title =
+    me.role === "detetive" ? "🔎 Seus traços" : "📜 Suas informações";
   return `<div class="investigation-private-info"><div class="investigation-private-title">${title}</div><ol>${items.map((item) => `<li>${esc(item.text_snapshot)}</li>`).join("")}</ol><small>Todos os traços mostrados são verdadeiros. A mentira só pode existir no que os jogadores contam.</small></div>`;
 }
 
@@ -2456,8 +2607,11 @@ function aliveOthers(playerId) {
 }
 
 function renderNightPanel(meta, me) {
-  const shouldAnimate = state.nightEnteredAt && Date.now() - state.nightEnteredAt < 1400;
-  const card = el(`<div class="card night-action-card${shouldAnimate ? " night-action-enter" : ""}"></div>`);
+  const shouldAnimate =
+    state.nightEnteredAt && Date.now() - state.nightEnteredAt < 1400;
+  const card = el(
+    `<div class="card night-action-card${shouldAnimate ? " night-action-enter" : ""}"></div>`,
+  );
   if (me.role === "cidadao") {
     card.innerHTML = `${roleAvatar("cidadao")}<div><p class="eyebrow">NOITE — SUA VEZ DE OBSERVAR</p><h2>Você é o Cidadão</h2><p>Você não tem ação nesta noite. Observe em silêncio.</p></div>`;
     return card;
@@ -2465,33 +2619,58 @@ function renderNightPanel(meta, me) {
   const headings = {
     assassino: ["Escolha uma vítima", "Escolha uma pessoa para eliminar."],
     anjo: ["Escolha quem proteger", "Escolha uma pessoa para proteger."],
-    detetive: ["Escolha uma pessoa e um eixo", "Descubra o valor real de um traço dessa pessoa."],
+    detetive: [
+      "Escolha uma pessoa e um eixo",
+      "Descubra o valor real de um traço dessa pessoa.",
+    ],
   };
   const [title, subtitle] = headings[me.role] || headings.cidadao;
-  const targets = me.role === "assassino" ? aliveOthers(me.id).filter((p) => p.role !== "assassino") : me.role === "detetive" ? aliveOthers(me.id) : (state.players || []).filter((p) => p.alive);
-  const box = el(`<div><div class="night-role-header">${roleAvatar(me.role)}<div><p class="eyebrow">NOITE — SUA AÇÃO</p><h2>Você é o <strong>${esc(ROLE_INFO[me.role].name)}</strong></h2></div></div><div class="action-heading">${roleActionIcon(me.role, 52)}<div><h3>${title}</h3><p>${subtitle}</p></div></div><div class="target-grid visual-target-grid" id="night-targets"></div></div>`);
+  const targets =
+    me.role === "assassino"
+      ? aliveOthers(me.id).filter((p) => p.role !== "assassino")
+      : me.role === "detetive"
+        ? aliveOthers(me.id)
+        : (state.players || []).filter((p) => p.alive);
+  const box = el(
+    `<div><div class="night-role-header">${roleAvatar(me.role)}<div><p class="eyebrow">NOITE — SUA AÇÃO</p><h2>Você é o <strong>${esc(ROLE_INFO[me.role].name)}</strong></h2></div></div><div class="action-heading">${roleActionIcon(me.role, 52)}<div><h3>${title}</h3><p>${subtitle}</p></div></div><div class="target-grid visual-target-grid" id="night-targets"></div></div>`,
+  );
   const grid = box.querySelector("#night-targets");
   targets.forEach((t) => {
     const row = el(`<div class="action-target-row visual-target-row"></div>`);
-    const button = el(`<button class="target-btn action-target-button visual-target-button"></button>`);
+    const button = el(
+      `<button class="target-btn action-target-button visual-target-button"></button>`,
+    );
     button.innerHTML = `${playerAvatar(t.name)}<span>${esc(t.name)}</span>`;
     if (state.selectedTarget === t.id) button.classList.add("selected");
     button.disabled = state.nightActionConfirmed;
-    button.onclick = () => { state.selectedTarget = t.id; if (me.role !== "detetive") state.selectedAxis = null; render(); };
+    button.onclick = () => {
+      state.selectedTarget = t.id;
+      if (me.role !== "detetive") state.selectedAxis = null;
+      render();
+    };
     row.appendChild(button);
     if (state.selectedTarget === t.id && !state.nightActionConfirmed) {
       if (me.role === "detetive") {
-        const axisBox = el(`<div class="trait-axis-picker"><p class="footnote">O que investigar?</p><div class="target-grid" id="axis-options"></div></div>`);
+        const axisBox = el(
+          `<div class="trait-axis-picker"><p class="footnote">O que investigar?</p><div class="target-grid" id="axis-options"></div></div>`,
+        );
         const axisGrid = axisBox.querySelector("#axis-options");
         getActiveAxes(meta).forEach((axis) => {
-          const b = el(`<button class="target-btn ${state.selectedAxis === axis ? "selected" : ""}"><span>${esc(TRAIT_CATEGORIES[axis].label)}</span></button>`);
-          b.onclick = () => { state.selectedAxis = axis; render(); };
+          const b = el(
+            `<button class="target-btn ${state.selectedAxis === axis ? "selected" : ""}"><span>${esc(TRAIT_CATEGORIES[axis].label)}</span></button>`,
+          );
+          b.onclick = () => {
+            state.selectedAxis = axis;
+            render();
+          };
           axisGrid.appendChild(b);
         });
         row.appendChild(axisBox);
       }
       if (me.role !== "detetive" || state.selectedAxis) {
-        const confirm = el(`<button class="action-confirm-btn" title="Confirmar ação" aria-label="Confirmar ação">✓</button>`);
+        const confirm = el(
+          `<button class="action-confirm-btn" title="Confirmar ação" aria-label="Confirmar ação">✓</button>`,
+        );
         confirm.onclick = confirmNightAction;
         row.appendChild(confirm);
       }
@@ -2502,20 +2681,39 @@ function renderNightPanel(meta, me) {
     if (me.role === "detetive") {
       const chosen = targets.find((t) => t.id === state.selectedTarget);
       const value = chosen ? traitValue(chosen, state.selectedAxis) : null;
-      const label = TRAIT_CATEGORIES[state.selectedAxis]?.description || "Traço";
-      if (chosen && value) box.appendChild(el(`<div class="investigation-result positive"><span class="investigation-symbol">✓</span><div><strong>${esc(chosen.name)} — ${esc(label)}</strong><p>${esc(value)}</p></div></div>`));
-    } else box.appendChild(el(`<div class="action-confirmed"><span class="confirm-check">✓</span><span>Ação confirmada.</span></div>`));
+      const label =
+        TRAIT_CATEGORIES[state.selectedAxis]?.description || "Traço";
+      if (chosen && value)
+        box.appendChild(
+          el(
+            `<div class="investigation-result positive"><span class="investigation-symbol">✓</span><div><strong>${esc(chosen.name)} — ${esc(label)}</strong><p>${esc(value)}</p></div></div>`,
+          ),
+        );
+    } else
+      box.appendChild(
+        el(
+          `<div class="action-confirmed"><span class="confirm-check">✓</span><span>Ação confirmada.</span></div>`,
+        ),
+      );
   }
   card.appendChild(box);
   return card;
 }
 
 function renderDayReveal(meta, me) {
-  const revealed = Array.isArray(meta.revealedTraits) ? meta.revealedTraits : [];
+  const revealed = Array.isArray(meta.revealedTraits)
+    ? meta.revealedTraits
+    : [];
   const last = revealed[revealed.length - 1];
   const label = last ? TRAIT_CATEGORIES[last.axis]?.label || last.axis : null;
-  const message = last ? `Descobriu-se que o assassino estava com ${label.toLowerCase()}: ${last.value}.` : (meta.lastDeathName ? `${esc(meta.lastDeathName)} não sobreviveu à noite.` : "Ninguém morreu esta noite.");
-  const card = el(`<div class="card day-event-card"><div class="event-icon death-icon">${meta.lastDeathName ? skullSvg(58) : sunriseSvg(58)}</div><p class="eyebrow">AO AMANHECER</p><h2>${message}</h2><p class="tagline">A cidade terá alguns segundos para absorver o que aconteceu.</p><div class="phase-mini-timer" id="day-reveal-timer">00:07</div></div>`);
+  const message = last
+    ? `Descobriu-se que o assassino estava com ${label.toLowerCase()}: ${last.value}.`
+    : meta.lastDeathName
+      ? `${esc(meta.lastDeathName)} não sobreviveu à noite.`
+      : "Ninguém morreu esta noite.";
+  const card = el(
+    `<div class="card day-event-card"><div class="event-icon death-icon">${meta.lastDeathName ? skullSvg(58) : sunriseSvg(58)}</div><p class="eyebrow">AO AMANHECER</p><h2>${message}</h2><p class="tagline">A cidade terá alguns segundos para absorver o que aconteceu.</p><div class="phase-mini-timer" id="day-reveal-timer">00:07</div></div>`,
+  );
   attachCountdown(card.querySelector("#day-reveal-timer"), meta);
   return card;
 }
@@ -2634,7 +2832,9 @@ function renderDayResults(meta, me) {
 function renderTruthHtml() {
   const meta = state.room;
   const scenario = getScenarioPreset(meta?.scenarioKey);
-  const revealed = Array.isArray(meta?.revealedTraits) ? meta.revealedTraits : [];
+  const revealed = Array.isArray(meta?.revealedTraits)
+    ? meta.revealedTraits
+    : [];
   return `<div class="card truth-card"><p class="eyebrow">A VERDADE DA PARTIDA</p><h2>${esc(scenario.name)}</h2><div class="truth-facts"><h3>Traços reais revelados</h3>${revealed.length ? `<ul>${revealed.map((r) => `<li>${esc(TRAIT_CATEGORIES[r.axis]?.label || r.axis)}: ${esc(r.value)}</li>`).join("")}</ul>` : `<p class="truth-summary">Nenhum traço foi revelado antes do fim.</p>`}</div></div>`;
 }
 
