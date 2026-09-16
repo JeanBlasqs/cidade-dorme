@@ -1061,75 +1061,29 @@ button {
 }
 
 
-/* Mantém avatar + nome juntos à esquerda em todas as opções de votação. */
-.target-identity {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-  margin-left: 0 !important;
-  order: 0;
-}
-.target-identity > span:last-child {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.target-identity .player-avatar {
-  flex: 0 0 34px;
-  margin-left: 0 !important;
-}
-.visual-target-button,
-.skip-button {
-  justify-content: flex-start !important;
-}
-.vote-bubbles {
-  margin-left: auto !important;
-  flex-shrink: 0;
-}
-.selection-check {
-  margin-left: 10px !important;
-  flex-shrink: 0;
-}
+    /* ===== celebração do fim da partida ===== */
+    .game-over-wrap{position:relative;overflow:hidden;min-height:calc(100dvh - 40px);}
+    .game-over-celebration{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden;}
+    .game-over-wrap .center-stage{position:relative;z-index:2;}
+    .winner-trophy-wrap{position:relative;width:92px;height:92px;margin:0 auto 8px;display:grid;place-items:center;}
+    .winner-trophy-wrap::before{content:"";position:absolute;inset:6px;border-radius:50%;background:radial-gradient(circle,rgba(242,192,120,.18),transparent 68%);animation:trophyPulse 1.8s ease-in-out infinite;}
+    .winner-trophy-wrap svg{position:relative;z-index:1;margin:0 !important;filter:drop-shadow(0 0 18px rgba(242,192,120,.24));}
+    .confetti-layer{position:absolute;inset:0;overflow:hidden;}
+    .confetti-piece{position:absolute;top:-24px;left:var(--confetti-x);width:8px;height:14px;border-radius:2px;opacity:0;transform:rotate(var(--confetti-rotate)) scale(var(--confetti-scale));animation:confettiFall var(--confetti-duration) cubic-bezier(.18,.72,.25,1) var(--confetti-delay) both;}
+    .confetti-piece:nth-child(4n){background:#f2c078;}
+    .confetti-piece:nth-child(4n+1){background:#e85b65;}
+    .confetti-piece:nth-child(4n+2){background:#8ec7ff;}
+    .confetti-piece:nth-child(4n+3){background:#7ee2a8;}
+    @keyframes confettiFall{0%{opacity:0;transform:translate3d(0,-20px,0) rotate(var(--confetti-rotate)) scale(var(--confetti-scale));}10%{opacity:1;}72%{opacity:1;}100%{opacity:0;transform:translate3d(var(--confetti-drift),108vh,0) rotate(calc(var(--confetti-rotate) + 540deg)) scale(var(--confetti-scale));}}
+    @keyframes trophyPulse{0%,100%{transform:scale(.94);opacity:.45;}50%{transform:scale(1.08);opacity:.9;}}
+    @media (prefers-reduced-motion:reduce){.confetti-piece,.winner-trophy-wrap::before{animation:none !important;}.confetti-piece{opacity:.8;top:10%;}}
 
-/* =========================================================
-   MORTE — TRANSIÇÃO CINEMATOGRÁFICA DA VÍTIMA
-   ========================================================= */
-.death-sequence-screen {
-  position: fixed; inset: 0; z-index: 10000;
-  width: 100vw; height: 100dvh;
-  display: grid; place-items: center; overflow: hidden;
-  background: #000; color: #eef3ff; isolation: isolate;
-}
-.death-sequence-eyelid {
-  position: absolute; left: 0; right: 0; height: 50%;
-  background: #000; z-index: 2; pointer-events: none;
-}
-.death-sequence-eyelid-top { top: 0; transform: translateY(-100%); animation: deathEyeTop 5.2s cubic-bezier(.7,0,.2,1) both; }
-.death-sequence-eyelid-bottom { bottom: 0; transform: translateY(100%); animation: deathEyeBottom 5.2s cubic-bezier(.7,0,.2,1) both; }
-.death-sequence-message {
-  position: relative; z-index: 3; width: min(90vw,520px);
-  text-align: center; opacity: 0; animation: deathMessage 5.2s ease both;
-  padding: 24px; box-sizing: border-box;
-}
-.death-sequence-skull { color: #e85b65; margin-bottom: 14px; }
-.death-sequence-message h1 { margin: 6px 0 12px; color: #e85b65; font-family: Georgia,serif; font-size: clamp(2.4rem,8vw,4rem); font-weight: 500; }
-.death-sequence-message p { color: #aebbd2; font-size: .95rem; line-height: 1.5; }
-.death-sequence-message strong { color: #f2c078; }
-.death-sequence-ghost { margin-top: 16px !important; color: #7f91af !important; font-size: .82rem !important; }
-@keyframes deathEyeTop {
-  0%{transform:translateY(-100%)} 7%{transform:translateY(-100%)}
-  30%{transform:translateY(0)} 47%{transform:translateY(0)} 100%{transform:translateY(-100%)}
-}
-@keyframes deathEyeBottom {
-  0%{transform:translateY(100%)} 7%{transform:translateY(100%)}
-  30%{transform:translateY(0)} 47%{transform:translateY(0)} 100%{transform:translateY(100%)}
-}
-@keyframes deathMessage {
-  0%,47%{opacity:0;transform:scale(.96);filter:blur(5px)}
-  61%{opacity:0} 73%,100%{opacity:1;transform:scale(1);filter:blur(0)}
-}
-@media (prefers-reduced-motion: reduce) {
-  .death-sequence-eyelid{animation-duration:1ms !important}
-  .death-sequence-message{animation-duration:1ms !important;opacity:1}
-}
+    .role-reveal-screen > .ghost-indicator,
+    .night-transition-screen > .ghost-indicator{
+      position:fixed;
+      top:18px;
+      left:50%;
+      transform:translateX(-50%);
+      margin:0;
+      z-index:10001;
+    }

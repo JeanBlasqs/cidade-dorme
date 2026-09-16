@@ -711,6 +711,7 @@ const AUDIO_ASSETS = {
   bell: "assets/audio/church-bell.mp3",
   owl: "assets/audio/owl.mp3",
   death: "assets/audio/heart-stop.mp3",
+  finalWin: "assets/audio/final-win.mp3",
 };
 
 const SESSION_KEY = "cidade-dorme-session-v1";
@@ -839,6 +840,8 @@ const state = {
   lastDeathSoundRound: null,
   deathSequenceActive: false,
   deathSequenceRound: null,
+  gameOverCelebrationKey: null,
+  gameOverAudio: null,
   nightRoleDone: { assassino: false, detetive: false, anjo: false },
   refreshInFlight: false,
   refreshQueued: false,
@@ -1049,6 +1052,8 @@ async function refreshOnce() {
     state.lastDataSignature = null;
     state.deathSequenceActive = false;
     state.deathSequenceRound = null;
+    state.gameOverCelebrationKey = null;
+    stopGameOverCelebrationAudio();
   } else if (meta.status === "active" && state.screen !== "game") {
     state.screen = "game";
     state.selectedTarget = null;
@@ -2003,6 +2008,7 @@ async function hostNextNight() {
 async function hostReplayRoom() {
   if (!state.isHost || state.busy) return;
 
+  stopGameOverCelebrationAudio();
   state.busy = true;
 
   const previousMeta = await dbGetRoom(state.roomCode);
@@ -2059,11 +2065,16 @@ async function hostReplayRoom() {
   state.selectedTarget = null;
   state.voteConfirmed = false;
   state.nightActionConfirmed = false;
+  state.deathSequenceActive = false;
+  state.deathSequenceRound = null;
+  state.gameOverCelebrationKey = null;
+  state.gameOverAudio = null;
   refresh();
 }
 
 function leaveToLanding() {
   stopPolling();
+  stopGameOverCelebrationAudio();
   clearSavedSession();
   Object.assign(state, {
     screen: "landing",
@@ -2083,6 +2094,10 @@ function leaveToLanding() {
     currentVotes: [],
     spectatorNightActions: [],
     showLobbySettings: false,
+    deathSequenceActive: false,
+    deathSequenceRound: null,
+    gameOverCelebrationKey: null,
+    gameOverAudio: null,
   });
   render();
 }
@@ -2566,11 +2581,19 @@ function renderGame() {
     return renderDeathSequence(me);
   }
 
-  // As duas fases cinematográficas ocupam a tela inteira.
-  // Assim a revelação e a chegada da noite não ficam presas dentro do layout normal.
-  if (meta.phase === "role_reveal")
-    return me.alive ? renderRoleReveal(meta, me) : renderSpectator(meta, me);
-  if (meta.phase === "night_transition") return renderNightTransition(meta, me);
+  // A tela "Você morreu" é exclusiva da sequência imediata da morte.
+  // Depois dela, o jogador morto continua vendo a mesma fase que os demais,
+  // apenas com o marcador de fantasma.
+  if (meta.phase === "role_reveal") {
+    const screen = renderRoleReveal(meta, me);
+    if (!me.alive) screen.appendChild(renderGhostIndicator());
+    return screen;
+  }
+  if (meta.phase === "night_transition") {
+    const screen = renderNightTransition(meta, me);
+    if (!me.alive) screen.appendChild(renderGhostIndicator());
+    return screen;
+  }
 
   const wrap = el(
     `<div class="wrap ${!me.alive ? "dead-player-view" : ""}"></div>`,
@@ -2730,7 +2753,6 @@ function renderNightTransition(meta, me = null) {
     <div class="night-cloud cloud-c"></div>
     <div class="night-cloud cloud-d"></div>
     <div class="night-cloud cloud-e"></div>
-    ${me && !me.alive ? renderGhostIndicator() : ""}
     <div class="night-transition-content">
       <div class="transition-moon">${moonSvg(72)}</div>
       <p class="transition-eyebrow">MEIA-NOITE</p>
@@ -2847,10 +2869,10 @@ function renderRoleReveal(meta, me) {
 }
 
 function renderGhostIndicator() {
-  return `<div class="ghost-indicator" aria-label="Você está morto e acompanhando a partida">
+  return el(`<div class="ghost-indicator" aria-label="Você está morto e acompanhando a partida">
     <span class="ghost-symbol">👻</span>
     <span>ESPECTADOR — VOCÊ ESTÁ MORTO</span>
-  </div>`;
+  </div>`);
 }
 
 function renderSpectator(meta, me) {
@@ -3303,16 +3325,62 @@ function renderTruthHtml() {
   return `<div class="card truth-card"><p class="eyebrow">A VERDADE DA PARTIDA</p><h2>${esc(scenario.name)}</h2><div class="truth-facts"><h3>Traços reais revelados</h3>${revealed.length ? `<ul>${revealed.map((r) => `<li>${esc(TRAIT_CATEGORIES[r.axis]?.label || r.axis)}: ${esc(r.value)}</li>`).join("")}</ul>` : `<p class="truth-summary">Nenhum traço foi revelado antes do fim.</p>`}</div></div>`;
 }
 
+function stopGameOverCelebrationAudio() {
+  try {
+    if (state.gameOverAudio) {
+      state.gameOverAudio.pause();
+      state.gameOverAudio.currentTime = 0;
+    }
+  } catch (_) {}
+  state.gameOverAudio = null;
+}
+
+function playGameOverCelebration(meta) {
+  const key = `${state.roomCode}:${Number(meta.round) || 0}:${meta.winner || "unknown"}`;
+  if (state.gameOverCelebrationKey === key) return;
+
+  state.gameOverCelebrationKey = key;
+  stopGameOverCelebrationAudio();
+
+  try {
+    const audio = new Audio(AUDIO_ASSETS.finalWin);
+    audio.preload = "auto";
+    audio.volume = 0.78;
+    audio.currentTime = 0;
+    state.gameOverAudio = audio;
+    audio.play().catch(() => {});
+  } catch (_) {
+    state.gameOverAudio = null;
+  }
+}
+
+function renderConfettiHtml(count = 44) {
+  return Array.from({ length: count }, (_, i) => {
+    const x = ((i * 37) % 100) - 8;
+    const drift = ((i * 19) % 140) - 70;
+    const rotate = (i * 73) % 360;
+    const delay = (i % 9) * 0.07;
+    const duration = 1.9 + (i % 6) * 0.16;
+    const scale = 0.72 + (i % 5) * 0.09;
+
+    return `<span class="confetti-piece" style="--confetti-x:${x}vw;--confetti-drift:${drift}px;--confetti-rotate:${rotate}deg;--confetti-delay:${delay}s;--confetti-duration:${duration}s;--confetti-scale:${scale};"></span>`;
+  }).join("");
+}
+
 function renderGameOver() {
   const meta = state.room;
   const cidadeVenceu = meta.winner === "cidade";
-  const me = myPlayer();
 
   const wrap = el(`<div class="wrap game-over-wrap">
-    ${me && !me.alive ? `<div class="card death-banner">${skullSvg(54)}<h2>Você morreu</h2><p>Você foi eliminado(a), mas pode continuar na sala e acompanhar o resultado.</p></div>` : ""}
+    <div class="game-over-celebration" aria-hidden="true">
+      <div class="confetti-layer">${renderConfettiHtml()}</div>
+    </div>
+
     <div class="center-stage">
       <div class="card winner-banner">
-        ${trophySvg(64)}
+        <div class="winner-trophy-wrap">
+          ${trophySvg(72)}
+        </div>
         <p class="eyebrow">FIM DA PARTIDA</p>
         <h1>${cidadeVenceu ? "Os cidadãos venceram!" : "Os assassinos venceram!"}</h1>
         <p class="tagline">${cidadeVenceu ? "Todos os assassinos foram eliminados." : "Os assassinos dominaram a cidade."}</p>
@@ -3345,8 +3413,16 @@ function renderGameOver() {
   });
 
   wrap.querySelector("#btn-newgame").onclick = leaveToLanding;
+
   const replayBtn = wrap.querySelector("#btn-replay");
-  if (replayBtn) replayBtn.onclick = hostReplayRoom;
+  if (replayBtn) {
+    replayBtn.onclick = async () => {
+      await unlockAudio();
+      await hostReplayRoom();
+    };
+  }
+
+  playGameOverCelebration(meta);
   return wrap;
 }
 
@@ -3742,6 +3818,17 @@ function trophySvg(size = 64) {
       text-align:center;
       border-color:var(--blood, #e85b65);
     }
+
+    .role-reveal-screen > .ghost-indicator,
+    .night-transition-screen > .ghost-indicator{
+      position:fixed;
+      top:18px;
+      left:50%;
+      transform:translateX(-50%);
+      margin:0;
+      z-index:10001;
+    }
+
     .death-banner h2 { color:var(--blood, #e85b65); margin:6px 0; }
 
     /* ===== VISUAL SYSTEM — referência cinematográfica ===== */
@@ -3981,6 +4068,24 @@ function trophySvg(size = 64) {
       .home-choice{min-height:112px !important;}
       .home-roles{margin-top:100px !important;}
     }
+
+    /* ===== celebração do fim da partida ===== */
+    .game-over-wrap{position:relative;overflow:hidden;min-height:calc(100dvh - 40px);}
+    .game-over-celebration{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden;}
+    .game-over-wrap .center-stage{position:relative;z-index:2;}
+    .winner-trophy-wrap{position:relative;width:92px;height:92px;margin:0 auto 8px;display:grid;place-items:center;}
+    .winner-trophy-wrap::before{content:"";position:absolute;inset:6px;border-radius:50%;background:radial-gradient(circle,rgba(242,192,120,.18),transparent 68%);animation:trophyPulse 1.8s ease-in-out infinite;}
+    .winner-trophy-wrap svg{position:relative;z-index:1;margin:0 !important;filter:drop-shadow(0 0 18px rgba(242,192,120,.24));}
+    .confetti-layer{position:absolute;inset:0;overflow:hidden;}
+    .confetti-piece{position:absolute;top:-24px;left:var(--confetti-x);width:8px;height:14px;border-radius:2px;opacity:0;transform:rotate(var(--confetti-rotate)) scale(var(--confetti-scale));animation:confettiFall var(--confetti-duration) cubic-bezier(.18,.72,.25,1) var(--confetti-delay) both;}
+    .confetti-piece:nth-child(4n){background:#f2c078;}
+    .confetti-piece:nth-child(4n+1){background:#e85b65;}
+    .confetti-piece:nth-child(4n+2){background:#8ec7ff;}
+    .confetti-piece:nth-child(4n+3){background:#7ee2a8;}
+    @keyframes confettiFall{0%{opacity:0;transform:translate3d(0,-20px,0) rotate(var(--confetti-rotate)) scale(var(--confetti-scale));}10%{opacity:1;}72%{opacity:1;}100%{opacity:0;transform:translate3d(var(--confetti-drift),108vh,0) rotate(calc(var(--confetti-rotate) + 540deg)) scale(var(--confetti-scale));}}
+    @keyframes trophyPulse{0%,100%{transform:scale(.94);opacity:.45;}50%{transform:scale(1.08);opacity:.9;}}
+    @media (prefers-reduced-motion:reduce){.confetti-piece,.winner-trophy-wrap::before{animation:none !important;}.confetti-piece{opacity:.8;top:10%;}}
+
   `;
   document.head.appendChild(style);
 })();
