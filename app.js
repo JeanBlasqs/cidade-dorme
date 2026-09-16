@@ -812,6 +812,7 @@ const AUDIO_ASSETS = {
 };
 
 const SESSION_KEY = "cidade-dorme-session-v1";
+const TAB_SESSION_KEY = "cidade-dorme-tab-session-v1";
 
 function saveSession() {
   try {
@@ -824,6 +825,10 @@ function saveSession() {
         isHost: state.isHost,
       }),
     );
+
+    // sessionStorage sobrevive ao F5 na mesma aba, mas não é reutilizado
+    // quando o site é aberto novamente em uma nova sessão de aba.
+    sessionStorage.setItem(TAB_SESSION_KEY, "1");
   } catch (err) {
     console.warn("Não foi possível salvar a sessão.", err);
   }
@@ -831,12 +836,20 @@ function saveSession() {
 function clearSavedSession() {
   try {
     localStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(TAB_SESSION_KEY);
   } catch (err) {
     console.warn("Não foi possível limpar a sessão.", err);
   }
 }
 function restoreSavedSession() {
   try {
+    // O localStorage mantém a identidade para o F5, mas não deve sozinho
+    // fazer uma nova abertura do site voltar para a partida anterior.
+    // O marcador de aba confirma que esta é a mesma sessão de navegador/aba.
+    if (sessionStorage.getItem(TAB_SESSION_KEY) !== "1") {
+      return false;
+    }
+
     const saved = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
     if (!saved?.playerId || !saved?.roomCode || !saved?.playerName)
       return false;
