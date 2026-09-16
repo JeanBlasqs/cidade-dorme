@@ -197,19 +197,17 @@ async function dbSubmitNightAction(
   targetId,
   targetAxis = null,
 ) {
-  const { error } = await sb
-    .from("night_actions")
-    .upsert(
-      {
-        room_code: code,
-        round,
-        role,
-        player_id: playerId,
-        target_id: targetId,
-        target_axis: targetAxis,
-      },
-      { onConflict: "room_code,round,role,player_id" },
-    );
+  const { error } = await sb.from("night_actions").upsert(
+    {
+      room_code: code,
+      round,
+      role,
+      player_id: playerId,
+      target_id: targetId,
+      target_axis: targetAxis,
+    },
+    { onConflict: "room_code,round,role,player_id" },
+  );
   if (error) console.error("dbSubmitNightAction", error);
 }
 async function dbGetNightActions(code, round, role) {
@@ -389,30 +387,57 @@ function hasSameActiveCombination(a, b, axes) {
 async function dbAssignTraits(code, players, meta) {
   const preset = getScenarioPreset(meta.scenarioKey);
   const axes = getActiveAxes(meta);
+
+  console.log("=== ATRIBUINDO TRAÇOS ===");
+  console.log("Cenário:", meta.scenarioKey);
+  console.log("Categorias:", meta.traitCategories);
+  console.log("Eixos ativos:", axes);
+  console.log("Preset:", preset);
+
+  if (!axes.length) {
+    console.error("Nenhum eixo de traço ativo!");
+    return null;
+  }
+
   const enriched = players.map((p) => ({ ...p }));
 
   for (const p of enriched) {
-    for (const axis of axes)
-      p[traitField(axis)] = randomTraitValue(preset, axis);
+    for (const axis of axes) {
+      const value = randomTraitValue(preset, axis);
+
+      p[traitField(axis)] = value;
+
+      console.log(`Jogador ${p.name} | ${axis} = ${value}`);
+    }
+
     if (meta.traitCategories.includes("intencao")) {
       p.traitIntencao =
         INTENTIONS[Math.floor(Math.random() * INTENTIONS.length)];
-    } else p.traitIntencao = null;
+    } else {
+      p.traitIntencao = null;
+    }
+
     p.traitTestemunhaAxis = null;
     p.traitTestemunhaValue = null;
   }
 
-  for (const axis of axes) ensureNoSingletonValues(enriched, preset, axis);
+  for (const axis of axes) {
+    ensureNoSingletonValues(enriched, preset, axis);
+  }
 
   const assassin = enriched.find((p) => p.role === "assassino");
+
   if (assassin && axes.length) {
     for (const p of enriched) {
       if (p.id === assassin.id) continue;
+
       if (hasSameActiveCombination(p, assassin, axes)) {
         const axis = axes[Math.floor(Math.random() * axes.length)];
+
         const choices = (preset[axis] || []).filter(
           (v) => v !== traitValue(assassin, axis),
         );
+
         p[traitField(axis)] =
           choices[Math.floor(Math.random() * choices.length)] ||
           randomTraitValue(preset, axis);
@@ -420,29 +445,7 @@ async function dbAssignTraits(code, players, meta) {
     }
   }
 
-  if (meta.traitCategories.includes("testemunha")) {
-    const alive = enriched.filter((p) => p.alive);
-    const count = Math.max(1, Math.round(alive.length * 0.3));
-    shuffle(alive)
-      .slice(0, count)
-      .forEach((witness) => {
-        const axis = axes[Math.floor(Math.random() * axes.length)];
-        const others = alive.filter((p) => p.id !== witness.id);
-        const seen = others[Math.floor(Math.random() * others.length)];
-        if (axis && seen) {
-          witness.traitTestemunhaAxis = axis;
-          witness.traitTestemunhaValue = traitValue(seen, axis);
-        }
-      });
-  }
-
   const updates = enriched.map((p) => ({
-    room_code: code,
-    id: p.id,
-    name: p.name,
-    alive: p.alive,
-    role: p.role,
-    ready_round: 0,
     trait_local: p.traitLocal || null,
     trait_objeto: p.traitObjeto || null,
     trait_vestimenta: p.traitVestimenta || null,
@@ -450,13 +453,27 @@ async function dbAssignTraits(code, players, meta) {
     trait_testemunha_axis: p.traitTestemunhaAxis || null,
     trait_testemunha_value: p.traitTestemunhaValue || null,
   }));
-  const { error } = await sb
-    .from("players")
-    .upsert(updates, { onConflict: "room_code,id" });
-  if (error) {
-    console.error("dbAssignTraits", error);
-    return null;
+
+  console.log("Valores que serão gravados:", updates);
+
+  for (let i = 0; i < enriched.length; i++) {
+    const player = enriched[i];
+    const values = updates[i];
+
+    const { error } = await sb
+      .from("players")
+      .update(values)
+      .eq("room_code", code)
+      .eq("id", player.id);
+
+    if (error) {
+      console.error("ERRO AO GRAVAR TRAÇOS:", player.name, error);
+      return null;
+    }
   }
+
+  console.log("=== TRAÇOS GRAVADOS COM SUCESSO ===");
+
   return enriched;
 }
 
