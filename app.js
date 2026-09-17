@@ -883,6 +883,7 @@ const state = {
   lastDeathSoundRound: null,
   deathSequenceActive: false,
   deathSequenceRound: null,
+  deathSequenceUntil: null,
   gameOverCelebrationKey: null,
   gameOverAudio: null,
   nightRoleDone: { assassino: false, detetive: false, anjo: false },
@@ -1066,23 +1067,40 @@ async function refreshOnce() {
     state.deathSequenceActive = true;
     state.deathSequenceRound = Number(meta.round);
 
-    // A vítima fica na tela preta somente até o MESMO deadline do servidor.
-    // Não usamos mais 10s a partir da detecção local, pois isso fazia a vítima
-    // ficar atrasada em relação aos demais jogadores quando o evento chegava
-    // alguns segundos depois.
-    const remainingMs = meta.phaseEndsAt
-      ? Math.max(0, meta.phaseEndsAt - Date.now())
-      : DAY_REVEAL_SECONDS * 1000;
+    // A vítima recebe uma sequência visual própria. O fim da sequência é
+    // sincronizado com o MESMO deadline usado pela revelação para todos.
+    // Guardamos o instante separadamente para que uma atualização de fase
+    // nunca faça a tela preta desaparecer antes da hora.
+    state.deathSequenceUntil = meta.phaseEndsAt
+      ? meta.phaseEndsAt
+      : Date.now() + DAY_REVEAL_SECONDS * 1000;
+
+    const remainingMs = Math.max(0, state.deathSequenceUntil - Date.now());
 
     window.setTimeout(() => {
-      state.deathSequenceActive = false;
-      refresh();
+      // Só esta sequência pode encerrar a tela da vítima. Se outra rodada já
+      // começou, o estado será limpo pela própria transição da partida.
+      if (
+        state.deathSequenceRound === Number(meta.round) &&
+        state.deathSequenceUntil <= Date.now()
+      ) {
+        state.deathSequenceActive = false;
+        state.deathSequenceUntil = null;
+        refresh();
+      }
     }, remainingMs);
   }
 
-  // Se o servidor já saiu da revelação, a tela preta nunca pode permanecer.
-  if (state.deathSequenceActive && meta.phase !== "day_reveal") {
+  // Não desligamos deathSequenceActive apenas porque o polling recebeu uma
+  // fase diferente. A tela da vítima precisa permanecer preta até o deadline
+  // de 10s, evitando o flash de espectador/ações noturnas.
+  if (
+    state.deathSequenceActive &&
+    state.deathSequenceUntil &&
+    state.deathSequenceUntil <= Date.now()
+  ) {
     state.deathSequenceActive = false;
+    state.deathSequenceUntil = null;
   }
 
   // O som da morte é um evento da rodada e deve ser ouvido por TODOS,
@@ -1136,6 +1154,7 @@ async function refreshOnce() {
     state.lastDataSignature = null;
     state.deathSequenceActive = false;
     state.deathSequenceRound = null;
+    state.deathSequenceUntil = null;
     state.gameOverCelebrationKey = null;
     stopGameOverCelebrationAudio();
   } else if (meta.status === "active" && state.screen !== "game") {
@@ -2195,6 +2214,7 @@ async function hostReplayRoom() {
   state.nightActionConfirmed = false;
   state.deathSequenceActive = false;
   state.deathSequenceRound = null;
+  state.deathSequenceUntil = null;
   state.gameOverCelebrationKey = null;
   state.gameOverAudio = null;
   refresh();
@@ -2819,13 +2839,13 @@ function renderGame() {
   const me = myPlayer();
   if (!me) return el(`<div class="wrap"><p>Carregando jogador...</p></div>`);
 
-  // A morte do próprio jogador acontece por cima da fase atual.
-  // Depois da animação, o render normal continua e ele vira espectador.
+  // A morte do próprio jogador acontece por cima de QUALQUER fase recebida
+  // durante os 10s da revelação. Isso impede o flash da tela de fantasma.
   if (state.deathSequenceActive) {
     return renderDeathSequence(me);
   }
 
-  // A tela "Você morreu" é exclusiva da sequência imediata da morte.
+  // A tela "Você morreu" termina somente quando o deadline da sequência acaba.
   // Depois dela, o jogador morto continua vendo a mesma fase que os demais,
   // apenas com o marcador de fantasma.
   if (meta.phase === "role_reveal") {
@@ -4199,9 +4219,16 @@ function trophySvg(size = 64) {
     .vote-skip-row .skip-button{margin-top:0 !important;}
     .spectator-option{cursor:default !important;}
     .day-reveal-screen{position:relative;overflow:hidden;}
+    /* A notícia da morte começa invisível e ganha nitidez durante 3s. */
     .death-awakening{animation:none;opacity:1;filter:none;transform:none;}
-    .death-awakening .event-icon,.death-awakening .eyebrow,.death-awakening h2,.death-awakening .tagline,.death-awakening .phase-mini-timer{animation:none;opacity:1;transform:none;filter:none;}
+    .death-awakening .event-icon,.death-awakening .eyebrow,.death-awakening h2,.death-awakening .tagline,.death-awakening .phase-mini-timer{
+      animation:dayDeathReveal 3s ease both;
+    }
     .death-screen-cinematic{animation:deathScreenFade 4.8s cubic-bezier(.2,.65,.2,1) both;}
+    @keyframes dayDeathReveal{
+      0%{opacity:0;transform:scale(.985);filter:blur(7px);}
+      100%{opacity:1;transform:scale(1);filter:blur(0);}
+    }
     @keyframes deathScreenFade{
       from{opacity:0;transform:scale(.985);filter:blur(5px);}
       to{opacity:1;transform:scale(1);filter:blur(0);}
@@ -4407,7 +4434,7 @@ document.addEventListener("pointerdown", unlockAudio, { passive: true });
       width: min(90vw, 520px);
       text-align: center;
       opacity: 0;
-      animation: deathMessage 1.1s ease both;
+      animation: deathMessage 3s ease both;
       padding: 24px;
       box-sizing: border-box;
     }
