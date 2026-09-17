@@ -698,6 +698,127 @@ function computeRoleCounts(n, configured = null) {
   };
 }
 
+function getRoleHistoryStorageKey(roomCode) {
+  return `cidade-dorme-role-history-v1-${roomCode}`;
+}
+
+function loadRoleHistory(roomCode) {
+  if (!roomCode) return {};
+  try {
+    const raw = localStorage.getItem(getRoleHistoryStorageKey(roomCode));
+    const parsed = raw ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== "object") return {};
+    return parsed;
+  } catch (err) {
+    console.warn("Não foi possível carregar o histórico de papéis.", err);
+    return {};
+  }
+}
+
+function saveRoleHistory(roomCode, history) {
+  if (!roomCode) return;
+  try {
+    localStorage.setItem(
+      getRoleHistoryStorageKey(roomCode),
+      JSON.stringify(history),
+    );
+  } catch (err) {
+    console.warn("Não foi possível salvar o histórico de papéis.", err);
+  }
+}
+
+function assignRolesWithDiversity(players, counts, roomCode) {
+  const roles = ["assassino", "detetive", "anjo", "cidadao"];
+  const availableRoles = roles.filter((role) => Number(counts[role]) > 0);
+  const history = loadRoleHistory(roomCode);
+
+  // Quando todos os jogadores já passaram por todos os papéis que existem
+  // nesta configuração, começamos um novo ciclo e voltamos a sortear livremente.
+  const cycleComplete = players.every((player) => {
+    const seen = Array.isArray(history[player.id]?.seen)
+      ? history[player.id].seen
+      : [];
+    return availableRoles.every((role) => seen.includes(role));
+  });
+
+  if (cycleComplete) {
+    for (const player of players) delete history[player.id];
+  }
+
+  const pool = shuffle([
+    ...Array(counts.assassino).fill("assassino"),
+    ...Array(counts.detetive).fill("detetive"),
+    ...Array(counts.anjo).fill("anjo"),
+    ...Array(counts.cidadao).fill("cidadao"),
+  ]);
+
+  // Em vez de um único shuffle, testamos várias distribuições aleatórias e
+  // escolhemos uma que minimize repetições. Assim a ordem continua aleatória,
+  // mas partidas consecutivas deixam de repetir os mesmos papéis por jogador
+  // quando existe uma distribuição possível sem repetição.
+  const attempts = 3000;
+  let best = null;
+  let bestScore = Infinity;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const shuffledPlayers = shuffle(players);
+    const shuffledPool = shuffle(pool);
+    let score = 0;
+
+    let exactLastAssignment = true;
+
+    for (let i = 0; i < shuffledPlayers.length; i++) {
+      const player = shuffledPlayers[i];
+      const role = shuffledPool[i];
+      const playerHistory = history[player.id] || {};
+      const seen = Array.isArray(playerHistory.seen)
+        ? playerHistory.seen
+        : [];
+      const timesSeen = Number(playerHistory.counts?.[role]) || 0;
+
+      if (history.__lastAssignment?.[player.id] !== role) {
+        exactLastAssignment = false;
+      }
+
+      if (seen.includes(role)) score += 10000 + timesSeen * 1000;
+      if (playerHistory.lastRole === role) score += 50000;
+    }
+
+    // Mesmo depois de completar um ciclo, evitamos repetir a distribuição
+    // inteira da partida anterior. Um jogador pode voltar a um papel, mas os
+    // demais serão redistribuídos de outra forma sempre que houver alternativa.
+    if (exactLastAssignment) score += 1000000;
+
+    if (score < bestScore) {
+      bestScore = score;
+      best = shuffledPlayers.map((player, i) => ({
+        player,
+        role: shuffledPool[i],
+      }));
+
+      if (bestScore === 0) break;
+    }
+  }
+
+  if (!best) return null;
+
+  history.__lastAssignment = {};
+
+  for (const { player, role } of best) {
+    history.__lastAssignment[player.id] = role;
+    const entry = history[player.id] || { seen: [], counts: {}, lastRole: null };
+    if (!Array.isArray(entry.seen)) entry.seen = [];
+    if (!entry.counts || typeof entry.counts !== "object") entry.counts = {};
+    if (!entry.seen.includes(role)) entry.seen.push(role);
+    entry.counts[role] = (Number(entry.counts[role]) || 0) + 1;
+    entry.lastRole = role;
+    history[player.id] = entry;
+  }
+
+  saveRoleHistory(roomCode, history);
+  return best;
+}
+
 function normalizeRoleCountsForPlayers(playerCount, configured) {
   if (playerCount < 4) return { assassino: 1, detetive: 1, anjo: 1 };
 
@@ -1650,15 +1771,13 @@ async function hostStartGame() {
     roomSettings.roleCounts,
   );
   const counts = computeRoleCounts(players.length, roleCounts);
-  const pool = shuffle([
-    ...Array(counts.assassino).fill("assassino"),
-    ...Array(counts.detetive).fill("detetive"),
-    ...Array(counts.anjo).fill("anjo"),
-    ...Array(counts.cidadao).fill("cidadao"),
-  ]);
-  const shuffledPlayers = shuffle(players);
+  const roleAssignments = assignRolesWithDiversity(
+    players,
+    counts,
+    state.roomCode,
+  );
 
-  if (pool.length !== shuffledPlayers.length) {
+  if (!roleAssignments || roleAssignments.length !== players.length) {
     state.busy = false;
     state.error = "Não foi possível distribuir os papéis corretamente.";
     render();
@@ -1666,10 +1785,10 @@ async function hostStartGame() {
   }
 
   await Promise.all(
-    shuffledPlayers.map((p, idx) =>
+    roleAssignments.map(({ player: p, role }) =>
       dbUpsertPlayer(state.roomCode, {
         ...p,
-        role: pool[idx],
+        role,
         alive: true,
         readyRound: 0,
       }),
