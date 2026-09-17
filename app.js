@@ -1066,18 +1066,28 @@ async function refreshOnce() {
     state.deathSequenceActive = true;
     state.deathSequenceRound = Number(meta.round);
 
+    // A vítima fica na tela preta somente até o MESMO deadline do servidor.
+    // Não usamos mais 10s a partir da detecção local, pois isso fazia a vítima
+    // ficar atrasada em relação aos demais jogadores quando o evento chegava
+    // alguns segundos depois.
+    const remainingMs = meta.phaseEndsAt
+      ? Math.max(0, meta.phaseEndsAt - Date.now())
+      : DAY_REVEAL_SECONDS * 1000;
+
     window.setTimeout(() => {
-      // A vítima permanece exclusivamente na tela preta durante toda a
-      // revelação de 10s. Ao terminar, atualizamos a fase do servidor e
-      // entramos diretamente na discussão.
       state.deathSequenceActive = false;
       refresh();
-    }, 10000);
+    }, remainingMs);
+  }
+
+  // Se o servidor já saiu da revelação, a tela preta nunca pode permanecer.
+  if (state.deathSequenceActive && meta.phase !== "day_reveal") {
+    state.deathSequenceActive = false;
   }
 
   // O som da morte é um evento da rodada e deve ser ouvido por TODOS,
-  // inclusive pela própria vítima. A tela preta continua sendo exclusiva
-  // do jogador que morreu.
+  // inclusive pela própria vítima. Ele é disparado uma única vez quando a
+  // revelação daquela rodada é recebida neste navegador.
   if (
     meta.phase === "day_reveal" &&
     meta.lastDeathName &&
@@ -1486,7 +1496,7 @@ function startPolling() {
   stopPolling();
   refresh();
   subscribeRealtime(state.roomCode);
-  state.pollHandle = setInterval(refresh, 8000);
+  state.pollHandle = setInterval(refresh, 2000);
 }
 function stopPolling() {
   if (state.pollHandle) {
@@ -3053,8 +3063,13 @@ function renderRoleReveal(meta, me) {
   const firstRound = Number(meta.round || 1) === 1;
   const info = ROLE_INFO[me.role] || ROLE_INFO.cidadao;
   const image = ROLE_IMAGES[me.role] || ROLE_IMAGES.cidadao;
-  const card = el(`<div class="card role-reveal-screen">
-    <div class="role-reveal-visual cinematic-role-card">
+  const card = el(`<div class="role-reveal-screen">
+    <div class="top-bar">
+      <span class="room-pill">Sala ${esc(state.roomCode)} · Rodada ${meta.round}</span>
+      <button class="link-btn" id="btn-leave">Sair</button>
+    </div>
+    <div class="card role-reveal-card">
+      <div class="role-reveal-visual cinematic-role-card">
       <p class="eyebrow">CIDADE DORME</p>
       <h2 class="reveal-heading">${firstRound ? "Revelando seu papel..." : `Informações da rodada ${meta.round}`}</h2>
       ${
@@ -3075,8 +3090,12 @@ function renderRoleReveal(meta, me) {
       </div>
       <button class="btn btn-primary" id="btn-ready" ${Number(me.readyRound || 0) === Number(meta.round) ? "disabled" : ""}>${Number(me.readyRound || 0) === Number(meta.round) ? "✓ Pronto" : "Li tudo — estou pronto"}</button>
       <p class="footnote" id="ready-count">Carregando jogadores prontos...</p>
+      </div>
     </div>
   </div>`);
+
+  const leaveButton = card.querySelector("#btn-leave");
+  if (leaveButton) leaveButton.onclick = leaveToLanding;
 
   const readyButton = card.querySelector("#btn-ready");
 
@@ -3565,7 +3584,7 @@ function playGameOverCelebration(meta) {
   try {
     const audio = new Audio(AUDIO_ASSETS.finalWin);
     audio.preload = "auto";
-    audio.volume = 0.78;
+    audio.volume = 0.40;
     audio.currentTime = 0;
     state.gameOverAudio = audio;
     audio.play().catch(() => {});
@@ -3709,6 +3728,12 @@ function trophySvg(size = 64) {
 (function injectGameStyles() {
   const style = document.createElement("style");
   style.textContent = `
+    .role-reveal-screen {
+      width: min(100%, 1100px);
+      margin: 0 auto;
+    }
+    .role-reveal-screen .top-bar { margin-bottom: 14px; }
+    .role-reveal-card { margin: 0; }
     .role-reveal-screen {
       position:fixed;
       inset:0;
@@ -4174,19 +4199,8 @@ function trophySvg(size = 64) {
     .vote-skip-row .skip-button{margin-top:0 !important;}
     .spectator-option{cursor:default !important;}
     .day-reveal-screen{position:relative;overflow:hidden;}
-    .death-awakening{animation:deathAwakening 10s cubic-bezier(.2,.6,.2,1) both;}
-    .death-awakening .event-icon,.death-awakening .eyebrow,.death-awakening h2,.death-awakening .tagline,.death-awakening .phase-mini-timer{animation:deathContentIn 9.2s ease both;}
-    @keyframes deathAwakening{
-      0%{opacity:0;transform:scale(.985);filter:blur(7px);}
-      32%{opacity:.18;filter:blur(5px);}
-      68%{opacity:.58;filter:blur(2px);}
-      100%{opacity:1;transform:scale(1);filter:blur(0);}
-    }
-    @keyframes deathContentIn{
-      0%{opacity:0;transform:translateY(12px);}
-      60%{opacity:.35;transform:translateY(4px);}
-      100%{opacity:1;transform:translateY(0);}
-    }
+    .death-awakening{animation:none;opacity:1;filter:none;transform:none;}
+    .death-awakening .event-icon,.death-awakening .eyebrow,.death-awakening h2,.death-awakening .tagline,.death-awakening .phase-mini-timer{animation:none;opacity:1;transform:none;filter:none;}
     .death-screen-cinematic{animation:deathScreenFade 4.8s cubic-bezier(.2,.65,.2,1) both;}
     @keyframes deathScreenFade{
       from{opacity:0;transform:scale(.985);filter:blur(5px);}
@@ -4380,12 +4394,12 @@ document.addEventListener("pointerdown", unlockAudio, { passive: true });
     .death-sequence-eyelid-top {
       top: 0;
       transform: translateY(-100%);
-      animation: deathEyeTop 10s cubic-bezier(.7, 0, .2, 1) both;
+      animation: deathEyeTop 1s cubic-bezier(.7, 0, .2, 1) both;
     }
     .death-sequence-eyelid-bottom {
       bottom: 0;
       transform: translateY(100%);
-      animation: deathEyeBottom 10s cubic-bezier(.7, 0, .2, 1) both;
+      animation: deathEyeBottom 1s cubic-bezier(.7, 0, .2, 1) both;
     }
     .death-sequence-message {
       position: relative;
@@ -4393,7 +4407,7 @@ document.addEventListener("pointerdown", unlockAudio, { passive: true });
       width: min(90vw, 520px);
       text-align: center;
       opacity: 0;
-      animation: deathMessage 10s ease both;
+      animation: deathMessage 1.1s ease both;
       padding: 24px;
       box-sizing: border-box;
     }
@@ -4410,22 +4424,19 @@ document.addEventListener("pointerdown", unlockAudio, { passive: true });
     .death-sequence-ghost { margin-top: 16px !important; color: #7f91af !important; font-size: .82rem !important; }
     @keyframes deathEyeTop {
       0% { transform: translateY(-100%); }
-      7% { transform: translateY(-100%); }
-      30% { transform: translateY(0); }
-      47% { transform: translateY(0); }
+      15% { transform: translateY(-100%); }
+      45% { transform: translateY(0); }
       100% { transform: translateY(-100%); }
     }
     @keyframes deathEyeBottom {
       0% { transform: translateY(100%); }
-      7% { transform: translateY(100%); }
-      30% { transform: translateY(0); }
-      47% { transform: translateY(0); }
+      15% { transform: translateY(100%); }
+      45% { transform: translateY(0); }
       100% { transform: translateY(100%); }
     }
     @keyframes deathMessage {
-      0%, 47% { opacity: 0; transform: scale(.96); filter: blur(5px); }
-      61% { opacity: 0; }
-      73%, 100% { opacity: 1; transform: scale(1); filter: blur(0); }
+      0% { opacity: 0; transform: scale(.97); filter: blur(4px); }
+      100% { opacity: 1; transform: scale(1); filter: blur(0); }
     }
     @media (prefers-reduced-motion: reduce) {
       .death-sequence-eyelid { animation-duration: 1ms !important; }
