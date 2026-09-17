@@ -1814,9 +1814,9 @@ async function hostStartGame() {
     "Os papéis foram distribuídos. A cidade se prepara para a primeira noite.",
   ];
 
-  const assignedPlayers = shuffledPlayers.map((p, idx) => ({
+  const assignedPlayers = roleAssignments.map(({ player: p, role }) => ({
     ...p,
-    role: pool[idx],
+    role,
     alive: true,
     readyRound: 0,
     traitLocal: null,
